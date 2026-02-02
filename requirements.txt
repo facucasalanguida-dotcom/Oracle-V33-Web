@@ -1,0 +1,16 @@
+pandas
+numpy
+gnews
+newspaper3k
+praw
+google-generativeai
+python-dotenv
+termcolor
+streamlit
+yfinance
+gnews
+streamlit
+yfinance
+gnews
+pandas
+matplotlib
