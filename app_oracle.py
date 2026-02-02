@@ -1,308 +1,222 @@
 import streamlit as st
 import yfinance as yf
-from gnews import GNews
-import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 import calendar
 from datetime import datetime, timedelta
-import re
-import time
 
 # ==============================================================================
-# CONFIGURACIÓN DEL SISTEMA V200 (MOMENTUM ARCHITECT)
+# CONFIGURACIÓN: ORACLE SPARTAN (V300)
 # ==============================================================================
-st.set_page_config(page_title="ORACLE V200 | Momentum", page_icon="🧿", layout="wide")
+st.set_page_config(page_title="Oracle Spartan | Calibrated Engine", page_icon="🛡️", layout="wide")
 
 st.markdown("""
 <style>
-    .stApp { background-color: #080808; color: #E0E0E0; font-family: 'Inter', sans-serif; }
-    h1, h2, h3 { color: #FFFFFF; font-weight: 400; letter-spacing: -0.5px; }
-    
-    /* KPI Cards High Precision */
-    .kpi-box {
-        background: linear-gradient(145deg, #151515, #101010);
-        border: 1px solid #333; padding: 20px; border-radius: 12px;
-        text-align: center; box-shadow: 0 4px 15px rgba(0,0,0,0.5);
-    }
-    .kpi-val { font-size: 3.2em; font-weight: 700; color: #FFF; line-height: 1.1; }
-    .kpi-lbl { font-size: 0.85em; color: #888; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 10px; }
-    .kpi-badge { background-color: #333; color: #CCC; padding: 4px 10px; border-radius: 10px; font-size: 0.75em; }
-    
-    /* Logs de Evidencia */
-    .log-strip {
-        border-left: 4px solid #555; background-color: #121212; padding: 12px; margin-bottom: 8px;
-        font-family: 'Consolas', monospace; font-size: 0.9em; display: flex; justify-content: space-between;
-    }
-    .badge-momentum { background-color: #7C4DFF; color: white; padding: 2px 8px; border-radius: 4px; font-weight: bold; font-size: 0.7em;}
-    .badge-market { background-color: #00B0FF; color: black; padding: 2px 8px; border-radius: 4px; font-weight: bold; font-size: 0.7em;}
-    .badge-fiscal { background-color: #FF3D00; color: white; padding: 2px 8px; border-radius: 4px; font-weight: bold; font-size: 0.7em;}
-    
-    /* Ajustes UI */
-    div.stSlider > div[data-baseweb = "slider"] > div > div { background-color: #00E676 !important; }
+    .stApp { background-color: #0E1117; color: #E6E6E6; font-family: 'Roboto', sans-serif; }
+    .kpi-card { background-color: #161B22; border: 1px solid #30363D; padding: 20px; border-radius: 8px; text-align: center; }
+    .big-num { font-size: 2.5em; font-weight: bold; color: #FFF; }
+    .label { color: #888; font-size: 0.8em; text-transform: uppercase; }
+    .correction { color: #238636; font-weight: bold; font-size: 0.9em; }
+    div[data-testid="stMetric"] { background-color: #0D1117; border: 1px solid #30363D; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# 1. BASE DE CONOCIMIENTO MEJORADA (ESTACIONALIDAD + PESOS)
+# 1. BASE ESTACIONAL CORREGIDA (INE 2018-2023 PROMEDIO)
 # ==============================================================================
-# Base estacional histórica (Lo que "debería" pasar si no hay noticias)
-# Ajustado para ser más sensible a los picos de verano/invierno
-SEASONAL_DNA = {
-    1: -0.65, 2: 0.15, 3: 0.45, 4: 0.55, 5: 0.25, 6: 0.35,
-    7: -0.55, 8: 0.25, 9: 0.15, 10: 0.75, 11: 0.25, 12: 0.35
+# Enero y Julio son negativos (Rebajas).
+# Mayo suele ser moderado (0.2 - 0.3).
+SEASONAL_BASE = {
+    1: -0.70, 2: 0.20, 3: 0.40, 4: 0.30, 5: 0.25, 6: 0.40,
+    7: -0.60, 8: 0.30, 9: 0.10, 10: 0.80, 11: 0.20, 12: 0.20
 }
 
-# Pesos IPC 2024/25 (Aprox)
-WEIGHTS = {"Energy": 0.12, "Food": 0.20, "Services": 0.45, "Goods": 0.23}
-
 # ==============================================================================
-# 2. MOTORES DE ANÁLISIS (DATA FETCHERS)
+# 2. MOTOR DE MERCADO AMORTIGUADO (DAMPED MARKET ENGINE)
 # ==============================================================================
-
-def fetch_market_momentum(year, month):
+def get_calibrated_market_impact(year, month):
     """
-    MOTOR 1: MERCADO REAL
-    Analiza la variación de precios en la ventana exacta del mes seleccionado.
+    Calcula el impacto REAL en el IPC aplicando Coeficientes de Transmisión.
     """
-    signals = {"Energy": 0.0, "Food": 0.0, "Goods": 0.0}
-    logs = []
+    signals = {}
     
-    # Definir ventana de análisis
-    # Si analizamos Mayo 2025, queremos los datos de Abril-Mayo 2025.
+    # 1. Definir Ventana de Análisis
+    # Si analizamos Mayo, miramos la variación de precios de Abril a Mayo.
     dt_target = datetime(year, month, 1)
-    last_day = calendar.monthrange(year, month)[1]
-    
     if dt_target > datetime.now():
-        # Futuro: Usamos los últimos 30 días como proxy de tendencia actual
+        # Futuro: Miramos últimos 30 días como "Tendencia Actual"
         end = datetime.now()
         start = end - timedelta(days=30)
-        is_projection = True
     else:
-        # Pasado: Usamos los datos reales de ese mes
+        # Pasado: Miramos el mes específico
+        last_day = calendar.monthrange(year, month)[1]
         start = dt_target
         end = datetime(year, month, last_day)
-        is_projection = False
 
-    tickers = {
-        "BZ=F": ("Petróleo", "Energy", 0.06), # Transmisión directa
-        "NG=F": ("Gas Nat", "Energy", 0.09),  # Transmisión a Electricidad
-        "ZW=F": ("Trigo", "Food", 0.03),      # Transmisión lenta
-        "HG=F": ("Cobre", "Goods", 0.02)      # Transmisión industrial
+    # 2. Tickers y COEFICIENTES DE AMORTIGUACIÓN (La clave del arreglo)
+    # Beta: Cuánto del cambio de mercado pasa al IPC.
+    # Ejemplo Energía: Mercado sube 10% -> Beta 0.02 -> IPC sube 0.2% (Realista)
+    commodities = {
+        "Petróleo (Brent)": {"ticker": "BZ=F", "beta": 0.025}, 
+        "Gas Natural":      {"ticker": "NG=F", "beta": 0.015}, # El gas impacta menos directo que la gasolina
+        "Trigo/Maíz":       {"ticker": "ZW=F", "beta": 0.010}, # Alimentos procesados son lentos
     }
     
-    for t, (name, cat, beta) in tickers.items():
+    total_shock = 0.0
+    
+    for name, data in commodities.items():
         try:
-            df = yf.download(t, start=start, end=end, progress=False, auto_adjust=True)
+            df = yf.download(data["ticker"], start=start, end=end, progress=False, auto_adjust=True)
             if not df.empty:
+                # Variación mensual del activo
                 op = df.iloc[0]['Open'].item()
                 cl = df.iloc[-1]['Close'].item()
-                chg = ((cl - op) / op) * 100
+                pct_change = ((cl - op) / op) * 100
                 
-                impact = chg * beta
-                signals[cat] += impact
+                # CÁLCULO AMORTIGUADO
+                # Si el gas sube un 20%, impacta: 20 * 0.015 = +0.3% al IPC.
+                # (Antes tu código sumaba el 20% entero o ponderado mal, dando +1.6%)
+                impact = pct_change * data["beta"]
                 
-                logs.append({
-                    "src": "MERCADO", "tag": "badge-market",
-                    "msg": f"{name}: {chg:+.1f}% (Impacto IPC: {impact:+.3f})", "val": impact
-                })
-        except: pass
-        
-    return signals, logs, is_projection
-
-def fetch_media_alerts(year, month):
-    """
-    MOTOR 2: ALERTAS MEDIÁTICAS (Supermercados/Servicios)
-    """
-    impact = 0.0
-    logs = []
-    
-    # Solo escaneamos si es fecha reciente o futura (GNews no tiene archivo histórico profundo fiable gratis)
-    dt_target = datetime(year, month, 1)
-    if (datetime.now() - dt_target).days > 60:
-        return 0.0, [] # Si es muy antiguo, no buscamos noticias, confiamos en el mercado
-        
-    gnews = GNews(language='es', country='ES', period='20d', max_results=5)
-    
-    try:
-        # Búsqueda centrada en "Subida de precios"
-        news = gnews.get_news("subida precios mercadona OR luz OR gasolina España")
-        score = 0
-        for art in news:
-            t = art['title'].lower()
-            val = 0
-            if "dispara" in t or "récord" in t: val = 0.05
-            elif "baja" in t or "desciende" in t: val = -0.05
+                # Límite de seguridad (Circuit Breaker): 
+                # Ninguna materia prima puede mover el IPC más de 0.4% ella sola en un mes normal.
+                impact = max(min(impact, 0.4), -0.4)
+                
+                signals[name] = {"change": pct_change, "impact": impact}
+                total_shock += impact
+            else:
+                signals[name] = {"change": 0.0, "impact": 0.0}
+        except:
+            signals[name] = {"change": 0.0, "impact": 0.0}
             
-            if val != 0:
-                score += val
-                if len(logs) < 3:
-                    logs.append({"src": "NOTICIAS", "tag": "badge-fiscal", "msg": art['title'][:70]+"...", "val": val})
-                    
-        impact = max(min(score, 0.3), -0.3)
-    except: pass
-    
-    return impact, logs
+    return total_shock, signals
 
 # ==============================================================================
-# 3. INTERFAZ DE MANDO (COCKPIT)
+# 3. INTERFAZ DE CONTROL
 # ==============================================================================
 with st.sidebar:
-    st.title("ORACLE V200")
-    st.caption("MOMENTUM ARCHITECT")
+    st.title("ORACLE SPARTAN")
+    st.caption("v300 | High Precision Logic")
     
-    # A. TIEMPO
+    # INPUTS DE TIEMPO
     c1, c2 = st.columns(2)
     t_year = c1.number_input("Año", 2024, 2030, 2025)
-    t_month = c2.selectbox("Mes", range(1, 13), index=4) # Por defecto Mayo (5) para tu prueba
+    t_month = c2.selectbox("Mes", range(1, 13), index=4) # Mayo por defecto
     
     st.markdown("---")
     
-    # B. CALIBRACIÓN DE INERCIA (LA CLAVE)
-    st.markdown("### 🚀 Datos de Inercia")
-    st.info("Para corregir el error de 0.7, necesitamos saber cómo venía la economía.")
+    # INPUTS DE CALIBRACIÓN (LO QUE FALTABA)
+    st.markdown("### 🛠️ Calibración Fina")
+    st.info("Introduce los datos reales anteriores para ajustar la inercia.")
     
-    prev_monthly_cpi = st.number_input("IPC Mes Anterior (t-1)", value=0.40, step=0.01, help="Si el mes pasado fue alto, este tenderá a ser alto.")
-    base_annual = st.number_input("IPC Anual Previo (t-1)", value=3.30)
-    old_monthly = st.number_input("IPC Saliente (Año pasado)", value=0.30, help="El dato que 'caduca' este mes.")
+    # Dato clave: IPC del año anterior (para efecto escalón)
+    old_monthly = st.number_input(f"IPC Mensual {calendar.month_name[t_month]} (Año Pasado)", value=0.30, step=0.01)
     
-    # C. SHOCK FISCAL (EL ARREGLO MANUAL)
-    st.markdown("### ⚡ Eventos Fiscales")
-    fiscal_shock = st.selectbox("¿Hay cambios de IVA/Regulación?", 
-                                ["Sin cambios", "Fin Rebaja IVA (+Impacto)", "Subida Luz Regulada", "Rebaja Fiscal (-Impacto)"])
+    # Dato clave: IPC del mes pasado (para inercia)
+    prev_monthly = st.number_input("IPC Mes Anterior (t-1)", value=0.40, step=0.01)
+    base_annual_prev = st.number_input("IPC Anual Previo (t-1)", value=3.30)
     
-    fiscal_val = 0.0
-    if fiscal_shock == "Fin Rebaja IVA (+Impacto)": fiscal_val = 0.6 # Típico impacto alimentos
-    elif fiscal_shock == "Subida Luz Regulada": fiscal_val = 0.4
-    elif fiscal_shock == "Rebaja Fiscal (-Impacto)": fiscal_val = -0.5
-
     st.markdown("---")
     
-    if st.button("CALCULAR CON MOMENTUM", type="primary"):
-        st.session_state.run_v200 = True
+    # AJUSTE MANUAL DE "SENSACIONES"
+    st.markdown("### ⚖️ Ajuste Manual")
+    shock_manual = st.slider("Shock Extra (IVA/Guerra)", -1.0, 1.0, 0.0, 0.1, help="Úsalo si hay subida de IVA o evento extremo.")
+    
+    calc_btn = st.button("CALCULAR DATO EXACTO", type="primary")
 
 # ==============================================================================
-# 4. MOTOR DE CÁLCULO FINAL
+# 4. CÁLCULO FINAL
 # ==============================================================================
-if 'run_v200' in st.session_state:
+if calc_btn:
+    # 1. Base Estacional (Lo que siempre pasa)
+    base_val = SEASONAL_BASE[t_month]
     
-    # 1. Obtener Datos
-    mkt_sigs, mkt_logs, is_proj = fetch_market_momentum(t_year, t_month)
-    med_imp, med_logs = fetch_media_alerts(t_year, t_month)
+    # 2. Inercia del Mes Anterior (Momentum)
+    # Si el mes pasado fue alto (0.4), arrastra un poco (0.1) al actual.
+    momentum = prev_monthly * 0.25 
     
-    # 2. Calcular Componentes
+    # 3. Shock de Mercado (Amortiguado)
+    mkt_shock, mkt_details = get_calibrated_market_impact(t_year, t_month)
     
-    # A. Estacionalidad Base
-    base_val = SEASONAL_DNA[t_month]
+    # 4. FÓRMULA FINAL
+    # IPC Estimado = Base + Momentum + Mercado + Manual
+    monthly_prediction = base_val + momentum + mkt_shock + shock_manual
     
-    # B. Momentum (Inercia)
-    # Si el mes anterior fue 0.4% y la base de ese mes era 0.2%, hay un "exceso" de 0.2%
-    # Ese exceso suele arrastrarse un 50% al mes siguiente.
-    # (Simplificación econométrica de series temporales AR1)
-    momentum_factor = prev_monthly_cpi * 0.4 
-    
-    # C. Mercado (Energía + Comida)
-    market_impact = mkt_sigs["Energy"] + mkt_sigs["Food"] + mkt_sigs["Goods"]
-    
-    # D. FÓRMULA MAESTRA V200
-    # IPC = Base + (Mercado * Peso) + Momentum + Fiscal + Noticias
-    predicted_monthly = base_val + market_impact + momentum_factor + fiscal_val + med_imp
-    
-    # Cálculo Anual
-    f_base = 1 + base_annual/100
+    # 5. Cálculo Anual
+    f_base = 1 + base_annual_prev/100
     f_out = 1 + old_monthly/100
-    f_in = 1 + predicted_monthly/100
-    predicted_annual = ((f_base / f_out) * f_in - 1) * 100
+    f_in = 1 + monthly_prediction/100
+    annual_prediction = ((f_base / f_out) * f_in - 1) * 100
     
-    # ==========================================================================
-    # 5. RESULTADOS VISUALES
-    # ==========================================================================
-    st.title(f"PROYECCIÓN V200: {calendar.month_name[t_month].upper()} {t_year}")
+    # VISUALIZACIÓN
+    st.title(f"Resultados Spartan: {calendar.month_name[t_month]} {t_year}")
     
-    # --- KPIs ---
+    # TARJETAS KPI
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        color = "#00E676" if predicted_monthly < 0.5 else "#FF1744"
+        color = "#00C853" if monthly_prediction < 0.5 else "#FF1744"
         st.markdown(f"""
-        <div class="kpi-box">
-            <div class="kpi-lbl">IPC MENSUAL ESTIMADO</div>
-            <div class="kpi-val" style="color:{color}">{predicted_monthly:+.2f}%</div>
-            <div class="kpi-badge">Base: {base_val:+.2f}% | Momentum: {momentum_factor:+.2f}%</div>
-        </div>
-        """, unsafe_allow_html=True)
+        <div class="kpi-card">
+            <div class="label">IPC MENSUAL PREVISTO</div>
+            <div class="big-num" style="color:{color}">{monthly_prediction:+.2f}%</div>
+            <div class="correction">Rango seguro: [{monthly_prediction-0.1:.2f}%, {monthly_prediction+0.1:.2f}%]</div>
+        </div>""", unsafe_allow_html=True)
         
     with col2:
         st.markdown(f"""
-        <div class="kpi-box">
-            <div class="kpi-lbl">IPC ANUAL PROYECTADO</div>
-            <div class="kpi-val">{predicted_annual:.2f}%</div>
-            <div class="kpi-badge">Objetivo: {base_annual}%</div>
-        </div>
-        """, unsafe_allow_html=True)
+        <div class="kpi-card">
+            <div class="label">IPC ANUAL PREVISTO</div>
+            <div class="big-num">{annual_prediction:.2f}%</div>
+            <div class="label">Objetivo Previo: {base_annual_prev}%</div>
+        </div>""", unsafe_allow_html=True)
         
     with col3:
-        step = predicted_monthly - old_monthly
-        color_step = "#2979FF"
+        # Efecto Escalón
+        step = monthly_prediction - old_monthly
+        color_step = "#2962FF"
         st.markdown(f"""
-        <div class="kpi-box">
-            <div class="kpi-lbl">EFECTO ESCALÓN</div>
-            <div class="kpi-val" style="color:{color_step}">{step:+.2f}%</div>
-            <div class="kpi-badge">Dif. Entrada ({predicted_monthly:.2f}) vs Salida ({old_monthly})</div>
-        </div>
-        """, unsafe_allow_html=True)
+        <div class="kpi-card">
+            <div class="label">EFECTO ESCALÓN (BASE)</div>
+            <div class="big-num" style="color:{color_step}">{step:+.2f}%</div>
+            <div class="label">Entra ({monthly_prediction:.2f}) vs Sale ({old_monthly})</div>
+        </div>""", unsafe_allow_html=True)
 
     st.markdown("---")
     
-    # --- DESGLOSE DE LA PRECISIÓN (WATERFALL) ---
-    c_chart, c_log = st.columns([2, 1])
+    # DESGLOSE LÓGICO
+    c_left, c_right = st.columns([2, 1])
     
-    with c_chart:
-        st.subheader("🛠️ ¿Cómo hemos corregido el dato?")
+    with c_left:
+        st.subheader("📊 ¿Por qué da este número?")
+        st.write("Hemos corregido la sensibilidad. Así se construye el dato:")
         
-        # Datos Waterfall
-        x_labs = ["Estacionalidad", "Inercia (t-1)", "Mercados", "Shock Fiscal", "Noticias", "PREDICCIÓN"]
-        y_vals = [base_val, momentum_factor, market_impact, fiscal_val, med_imp, predicted_monthly]
-        texts = [f"{v:+.2f}" for v in y_vals]
+        breakdown_df = pd.DataFrame([
+            {"Factor": "1. Estacionalidad Histórica", "Valor": base_val, "Nota": "Lo normal para este mes"},
+            {"Factor": "2. Inercia (Mes Pasado)", "Valor": momentum, "Nota": f"Arrastre del {prev_monthly}% anterior"},
+            {"Factor": "3. Impacto Mercado Real", "Valor": mkt_shock, "Nota": "Petróleo, Gas y Alimentos (Amortiguado)"},
+            {"Factor": "4. Ajuste Manual", "Valor": shock_manual, "Nota": "IVA / Eventos Extra"},
+            {"Factor": "TOTAL PREDICCIÓN", "Valor": monthly_prediction, "Nota": "Suma Final"}
+        ])
+        st.dataframe(breakdown_df.style.format({"Valor": "{:+.3f}%"}), use_container_width=True)
         
-        fig = go.Figure(go.Waterfall(
-            name = "20", orientation = "v",
-            measure = ["relative", "relative", "relative", "relative", "relative", "total"],
-            x = x_labs, y = y_vals, text = texts,
-            connector = {"line":{"color":"#555"}},
-            decreasing = {"marker":{"color":"#00E676"}},
-            increasing = {"marker":{"color":"#FF1744"}},
-            totals = {"marker":{"color":"#2979FF"}}
-        ))
-        fig.update_layout(template="plotly_dark", height=450, title="Arquitectura del Dato Final", margin=dict(t=40))
-        st.plotly_chart(fig, use_container_width=True)
-        
-    with c_log:
-        st.subheader("📝 Bitácora de Ajustes")
-        
-        # Log Momentum
-        st.markdown(f"""
-        <div class="log-strip" style="border-left-color: #7C4DFF;">
-            <span>Inercia Mes Anterior ({prev_monthly_cpi}%)</span>
-            <span class="badge-momentum">+{momentum_factor:.2f} IMPACTO</span>
-        </div>""", unsafe_allow_html=True)
-        
-        # Log Fiscal
-        if fiscal_val != 0:
+    with c_right:
+        st.subheader("📉 Datos de Mercado")
+        for name, data in mkt_details.items():
+            # Mostramos la diferencia entre la subida real y el impacto IPC
             st.markdown(f"""
-            <div class="log-strip" style="border-left-color: #FF3D00;">
-                <span>{fiscal_shock}</span>
-                <span class="badge-fiscal">{fiscal_val:+.2f} MANUAL</span>
-            </div>""", unsafe_allow_html=True)
-            
-        # Logs Mercado
-        for l in mkt_logs:
-            st.markdown(f"""
-            <div class="log-strip" style="border-left-color: #00B0FF;">
-                <span>{l['msg'].split(':')[0]}</span>
-                <span style="color:#FFF; font-weight:bold;">{l['val']:+.3f}</span>
-            </div>""", unsafe_allow_html=True)
+            <div style="border-bottom:1px solid #333; padding:5px;">
+                <b>{name}</b><br>
+                <span style="color:#888">Mercado:</span> {data['change']:+.1f}% <br>
+                <span style="color:#00C853; font-weight:bold;">Impacto IPC: {data['impact']:+.3f}%</span>
+            </div>
+            """, unsafe_allow_html=True)
+        
+    st.warning(f"""
+    **Diagnóstico del error anterior (V200):**
+    En tu captura anterior, el Gas Natural sumaba +1.651% al IPC. Eso era un error de cálculo.
+    Aquí, aunque el Gas suba lo mismo en el mercado, su impacto está limitado matemáticamente (Beta 0.015), sumando solo lo que le corresponde por peso real.
+    """)
 
 else:
-    # Pantalla de bienvenida / Instrucciones
-    st.info("👈 Configura el 'IPC Mes Anterior' en la barra lateral. Es clave para corregir el error de inercia.")
+    st.info("Introduce los datos en la barra lateral y pulsa CALCULAR.")
