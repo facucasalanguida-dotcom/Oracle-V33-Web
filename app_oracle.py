@@ -1,231 +1,317 @@
 import streamlit as st
 import yfinance as yf
+from gnews import GNews
 import plotly.graph_objects as go
+import plotly.figure_factory as ff
+import pandas as pd
 import numpy as np
 import calendar
 from datetime import datetime, timedelta
+import re
+import time
 
-# --- CONFIGURACIÓN MINIMALISTA ---
-st.set_page_config(page_title="ORACLE ZERO | Structural", page_icon="Ø", layout="wide")
+# ==============================================================================
+# 0. CONFIGURACIÓN DEL SISTEMA (MODO DARK PRO)
+# ==============================================================================
+st.set_page_config(page_title="OMEGA FINAL | Inflation Architect", page_icon="🏛️", layout="wide")
 
 st.markdown("""
 <style>
-    .stApp { background-color: #000000; color: #FFFFFF; }
-    h1, h2, h3 { font-family: 'Helvetica', sans-serif; color: #FFFFFF; letter-spacing: -1px; }
-    .big-kpi { font-size: 3em; font-weight: bold; color: #FFF; line-height: 1; }
-    .sub-kpi { font-size: 0.9em; color: #888; text-transform: uppercase; letter-spacing: 1px; }
-    .card { background-color: #111; padding: 20px; border-radius: 10px; border: 1px solid #333; }
-    div[data-testid="stMetric"] { background-color: #111; border: 1px solid #333; }
+    /* Estética de Terminal Financiera */
+    .stApp { background-color: #000000; color: #E0E0E0; font-family: 'Roboto', sans-serif; }
+    h1, h2, h3 { color: #FFFFFF; font-weight: 300; letter-spacing: -0.5px; }
+    
+    /* KPI Cards */
+    .kpi-card {
+        background-color: #111; border: 1px solid #333; padding: 20px; border-radius: 8px;
+        text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+    }
+    .kpi-val { font-size: 2.8em; font-weight: 700; color: #FFF; margin: 5px 0; }
+    .kpi-lbl { font-size: 0.8em; color: #888; text-transform: uppercase; letter-spacing: 1.5px; }
+    .kpi-sub { font-size: 0.85em; color: #4CAF50; font-family: monospace; }
+    
+    /* Evidence Logs */
+    .log-entry {
+        border-left: 3px solid #555; background-color: #161616; padding: 10px; margin-bottom: 5px;
+        font-family: 'Consolas', monospace; font-size: 0.85em;
+    }
+    .tag { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.7em; font-weight: bold; margin-right: 5px;}
+    .tag-mkt { background: #2196F3; color: white; }
+    .tag-ret { background: #FF9800; color: black; }
+    .tag-mac { background: #9C27B0; color: white; }
+    
+    /* Sliders custom */
+    div.stSlider > div[data-baseweb = "slider"] > div > div { background-color: #4CAF50 !important; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# 1. LA LEY DE HIERRO (ESTACIONALIDAD HISTÓRICA DE ESPAÑA)
+# 1. BASE DE CONOCIMIENTO (LA ESTRUCTURA RÍGIDA)
 # ==============================================================================
-# Promedios reales aproximados del IPC mensual en España (2010-2023)
-# Enero y Julio son negativos por las REBAJAS. Esto es la base inamovible.
-SEASONAL_BASELINE = {
-    1: -0.60,  # Enero: Rebajas invierno (-0.5 a -1.0)
-    2: 0.10,   # Feb: Rebote técnico
-    3: 0.40,   # Mar: Nueva temporada ropa / Semana Santa
-    4: 0.50,   # Abr: Continuación temporada
-    5: 0.20,   # May: Calma
-    6: 0.30,   # Jun: Pre-verano
-    7: -0.50,  # Jul: Rebajas verano
-    8: 0.20,   # Ago: Turismo
-    9: 0.10,   # Sep: Fin rebajas
-    10: 0.70,  # Oct: Ropa invierno (El mes más inflacionista)
-    11: 0.20,  # Nov: Calma
-    12: 0.30   # Dic: Navidad / Alimentos
+# Estacionalidad histórica de España (La Ley de Hierro).
+# Enero y Julio SIEMPRE bajan. Octubre y Marzo SIEMPRE suben.
+SEASONAL_DNA = {
+    1: -0.60, 2: 0.10, 3: 0.40, 4: 0.50, 5: 0.20, 6: 0.30,
+    7: -0.50, 8: 0.20, 9: 0.10, 10: 0.70, 11: 0.20, 12: 0.30
 }
 
+# Pesos aproximados del INE (2024/25)
+W_ENERGY = 0.12  # Grupo 04 + 07
+W_FOOD = 0.20    # Grupo 01
+W_CORE = 0.68    # Resto (Servicios, Bienes industriales)
+
 # ==============================================================================
-# 2. MOTOR DE DATOS REALES (MERCADO)
+# 2. MOTORES DE INTELIGENCIA (DATA FETCHERS)
 # ==============================================================================
-def get_market_drift(year, month):
+
+def fetch_market_signals(year, month):
     """
-    Calcula cuánto se desvía el mercado HOY respecto a lo 'normal'.
-    Si el petróleo suele estar plano pero sube un 10%, añadimos presión.
+    MOTOR 1: MERCADOS (HARD DATA)
+    Analiza materias primas y divisas para sugerir ajustes automáticos.
     """
-    # Tickers clave
-    tickers = {
-        "Petróleo (Brent)": "BZ=F",
-        "Gas Natural": "NG=F",
-        "Trigo (Alimentos)": "ZW=F"
-    }
+    signals = {"energy": 0.0, "food": 0.0, "macro": 0.0}
+    logs = []
     
-    # Fechas
+    # Ventana de tiempo (últimos 30 días respecto a la fecha objetivo)
     dt_target = datetime(year, month, 1)
     if dt_target > datetime.now():
-        end = datetime.now()
-        start = end - timedelta(days=30)
+        end = datetime.now(); start = end - timedelta(days=30)
     else:
-        last_day = calendar.monthrange(year, month)[1]
-        start = dt_target
-        end = datetime(year, month, last_day)
+        last = calendar.monthrange(year, month)[1]
+        start = dt_target; end = datetime(year, month, last)
         
-    market_data = {}
+    tickers = {
+        "BZ=F": ("Petróleo", "energy", 0.05), # 5% de transmisión al IPC
+        "NG=F": ("Gas Nat", "energy", 0.08),  # 8% de transmisión (Luz)
+        "ZW=F": ("Trigo", "food", 0.02),      # 2% transmisión (Lenta)
+        "EURUSD=X": ("Euro", "macro", -0.1)   # Inverso: Euro sube -> IPC baja
+    }
     
-    for name, sym in tickers.items():
+    for t, (name, cat, beta) in tickers.items():
         try:
-            df = yf.download(sym, start=start, end=end, progress=False, auto_adjust=True)
+            df = yf.download(t, start=start, end=end, progress=False, auto_adjust=True)
             if not df.empty:
-                open_p = df.iloc[0]['Open'].item()
-                close_p = df.iloc[-1]['Close'].item()
-                chg = ((close_p - open_p) / open_p) * 100
-                market_data[name] = chg
-            else:
-                market_data[name] = 0.0
-        except:
-            market_data[name] = 0.0
+                op = df.iloc[0]['Open'].item(); cl = df.iloc[-1]['Close'].item()
+                chg = ((cl - op) / op) * 100
+                
+                impact = chg * beta
+                signals[cat] += impact
+                
+                icon = "📈" if chg > 0 else "📉"
+                logs.append({
+                    "src": "MARKET", "tag": "tag-mkt", 
+                    "msg": f"{name}: {chg:+.1f}% (Impacto est: {impact:+.3f})", "val": impact
+                })
+        except: pass
+        
+    return signals, logs
+
+def fetch_retail_sentiment():
+    """
+    MOTOR 2: RETAIL SCANNER (SOFT DATA)
+    Busca noticias específicas de supermercados para ajustar alimentos.
+    """
+    impact = 0.0
+    logs = []
+    
+    gnews = GNews(language='es', country='ES', period='20d', max_results=8)
+    # Búsqueda quirúrgica
+    query = "precio mercadona OR carrefour OR aceite OR leche supermercado España"
+    
+    try:
+        news = gnews.get_news(query)
+        score = 0
+        for art in news:
+            t = art['title'].lower()
+            val = 0
+            if "sube" in t or "dispara" in t or "caro" in t: val = 1
+            elif "baja" in t or "barato" in t or "oferta" in t: val = -1
             
-    return market_data
+            # Detección de cifras (Regex)
+            match = re.search(r'(\d+)%', t)
+            if match:
+                magnitude = float(match.group(1)) * 0.01 # 10% -> 0.1
+                val = val * (magnitude * 10) # Potenciamos si hay cifra
+            
+            if val != 0:
+                score += val
+                if len(logs) < 5:
+                    logs.append({
+                        "src": "RETAIL", "tag": "tag-ret",
+                        "msg": f"{art['title'][:60]}...", "val": val
+                    })
+        
+        # Normalizar: Si hay mucho ruido de subida, añadimos hasta 0.2% al IPC de comida
+        impact = max(min(score * 0.02, 0.3), -0.3)
+        
+    except: pass
+    
+    return impact, logs
 
 # ==============================================================================
-# 3. INTERFAZ DE CONTROL (HUMAN IN THE LOOP)
+# 3. INTERFAZ DE CONTROL (LA CABINA DE PILOTO)
 # ==============================================================================
 with st.sidebar:
-    st.title("ORACLE ZERO")
-    st.caption("STRUCTURAL LOGIC ENGINE")
+    st.title("OMEGA FINAL")
+    st.caption("Arquitectura Híbrida Supervisada")
     
-    st.header("1. Coordenadas")
-    t_year = st.number_input("Año", 2024, 2030, 2026)
-    t_month = st.selectbox("Mes", range(1, 13))
+    # A. Coordenadas Temporales
+    col_y, col_m = st.columns(2)
+    t_year = col_y.number_input("Año", 2024, 2030, 2026)
+    t_month = col_m.selectbox("Mes", range(1, 13), index=0)
     
-    st.header("2. Punto de Partida")
-    # Datos críticos para el cálculo anual
-    base_annual = st.number_input("IPC Anual Previo (t-1)", value=2.90, format="%.2f")
-    old_monthly = st.number_input("IPC Mensual Saliente (Año pasado)", value=-0.20, format="%.2f", help="Dato del mismo mes el año pasado")
+    st.markdown("---")
     
-    st.divider()
+    # B. Calibración del Pasado (CRÍTICO)
+    st.markdown("**1. Datos de Calibración (INE)**")
+    base_annual = st.number_input("IPC Anual Previo (t-1)", value=2.90)
+    old_monthly = st.number_input("IPC Mensual Saliente", value=-0.20, help="Dato del mismo mes el año pasado")
     
-    # OBTENER DATOS DE MERCADO AUTOMÁTICOS
-    market_real = get_market_drift(t_year, t_month)
+    st.markdown("---")
     
-    st.header("3. Calibración de Motores")
-    st.caption("Ajusta las desviaciones respecto a lo 'Normal'.")
+    # C. Ejecución de Motores
+    st.markdown("**2. Análisis de Datos (Automático)**")
+    if st.button("ESCANEAR Y CALIBRAR", type="primary"):
+        with st.spinner("Analizando Mercados, Retail y Macroeconomía..."):
+            mkt_sig, mkt_logs = fetch_market_signals(t_year, t_month)
+            ret_sig, ret_logs = fetch_retail_sentiment()
+            
+            # Guardar en sesión para persistencia
+            st.session_state.auto_energy = mkt_sig["energy"]
+            st.session_state.auto_food = mkt_sig["food"] + ret_sig
+            st.session_state.auto_logs = mkt_logs + ret_logs
+            st.session_state.scanned = True
+            
+    # Valores por defecto (si no se ha escaneado)
+    def_energy = st.session_state.get("auto_energy", 0.0)
+    def_food = st.session_state.get("auto_food", 0.0)
     
-    # MOTOR 1: ENERGÍA (Petróleo/Gas)
-    # Sugerencia basada en dato real
-    sug_energy = market_real.get("Petróleo (Brent)", 0) * 0.1 + market_real.get("Gas Natural", 0) * 0.05
-    energy_drift = st.slider(f"⚡ Desvío Energía ({sug_energy:+.1f}%)", -2.0, 2.0, float(sug_energy/10), 0.01, help="Si el petróleo sube mucho, mueve esto a la derecha.")
+    st.markdown("---")
     
-    # MOTOR 2: ALIMENTOS
-    sug_food = market_real.get("Trigo (Alimentos)", 0) * 0.05
-    food_drift = st.slider(f"🍎 Desvío Alimentos ({sug_food:+.1f}%)", -1.0, 1.0, float(sug_food/10), 0.01)
+    # D. Ajuste Fino (Supervisión Humana)
+    st.markdown("**3. Control de Vuelo (Ajuste Fino)**")
     
-    # MOTOR 3: CORE / SUBYACENTE
-    core_drift = st.slider("👕 Desvío Subyacente (Servicios/Ropa)", -0.5, 0.5, 0.0, 0.01, help="Usa esto para ajustar si las rebajas son más o menos agresivas de lo normal.")
+    # Slider Energía (Pre-cargado con datos de mercado)
+    drift_energy = st.slider("⚡ Ajuste Energía (Petróleo/Luz)", -1.0, 1.0, float(def_energy), 0.01)
+    
+    # Slider Alimentos (Pre-cargado con Mercado + Retail)
+    drift_food = st.slider("🍎 Ajuste Alimentos (Supermercado)", -0.5, 0.5, float(def_food), 0.01)
+    
+    # Slider Core (Manual)
+    drift_core = st.slider("👕 Ajuste Subyacente (Servicios)", -0.5, 0.5, 0.0, 0.01, help="Usa esto si prevés rebajas agresivas o subida de hostelería")
 
 # ==============================================================================
-# 4. MOTOR DE CÁLCULO ESTRUCTURAL
+# 4. MOTOR DE CÁLCULO ESTRUCTURAL (MATH CORE)
 # ==============================================================================
 
-# A. Base Histórica (La gravedad)
-base_seasonal = SEASONAL_BASELINE[t_month]
+# 1. Base Estacional (El ancla)
+base_val = SEASONAL_DNA[t_month]
 
-# B. Pesos del IPC (Aproximados INE)
-W_ENERGY = 0.12
-W_FOOD = 0.20
-W_CORE = 0.68
+# 2. Suma Ponderada de Desviaciones (Drifts)
+# IPC Mensual = Base Estacional + (Desvío Energía * 0.12) + (Desvío Comida * 0.20) + (Desvío Core * 0.68)
+weighted_drift = (drift_energy * W_ENERGY) + (drift_food * W_FOOD) + (drift_core * W_CORE)
+monthly_prediction = base_val + weighted_drift
 
-# C. Cálculo de la Predicción Mensual
-# Fórmula: Base + (Impacto Energía * Peso) + (Impacto Comida * Peso) + (Impacto Core * Peso)
-# Nota: La base ya incluye el comportamiento "normal". Los drifts son el EXCESO sobre lo normal.
-monthly_prediction = base_seasonal + (energy_drift * W_ENERGY) + (food_drift * W_FOOD) + (core_drift * W_CORE)
-
-# D. Cálculo Anual (Chain Linking)
-# IPC Anual = ((1 + IPC_Anual_Previo) / (1 + IPC_Mensual_Saliente)) * (1 + IPC_Mensual_Entrante) - 1
-f_base = 1 + (base_annual / 100)
-f_out = 1 + (old_monthly / 100)
-f_in = 1 + (monthly_prediction / 100)
-
+# 3. Cálculo Anual (Chain Linking)
+f_base = 1 + base_annual/100
+f_out = 1 + old_monthly/100
+f_in = 1 + monthly_prediction/100
 annual_prediction = ((f_base / f_out) * f_in - 1) * 100
 
-# ==============================================================================
-# 5. VISUALIZACIÓN
-# ==============================================================================
-st.title(f"Proyección Estructural: {calendar.month_name[t_month].upper()} {t_year}")
+# 4. Monte Carlo "Lite" (Solo para intervalo de confianza visual)
+# Simulamos ruido alrededor de NUESTRA predicción, no aleatoriedad total.
+sims = np.random.normal(monthly_prediction, 0.05, 1000)
+p5, p95 = np.percentile(sims, [5, 95])
 
-# --- TARJETAS PRINCIPALES ---
+# ==============================================================================
+# 5. DASHBOARD EJECUTIVO
+# ==============================================================================
+st.title(f"PROYECCIÓN OMEGA: {calendar.month_name[t_month].upper()} {t_year}")
+
+# --- FILA 1: KPIs ---
 c1, c2, c3 = st.columns(3)
 
 with c1:
-    color = "#4CAF50" if monthly_prediction < 0 else "#FF5252"
+    color_m = "#4CAF50" if monthly_prediction < 0 else "#FF5252"
     st.markdown(f"""
-    <div class="card">
-        <div class="sub-kpi">IPC MENSUAL ESTIMADO</div>
-        <div class="big-kpi" style="color:{color}">{monthly_prediction:+.2f}%</div>
-        <div style="color:#666; margin-top:5px;">Base Histórica: {base_seasonal:+.2f}%</div>
+    <div class="kpi-card">
+        <div class="kpi-lbl">IPC MENSUAL ESTIMADO</div>
+        <div class="kpi-val" style="color:{color_m}">{monthly_prediction:+.2f}%</div>
+        <div class="kpi-sub">Base Estacional: {base_val:+.2f}%</div>
     </div>
     """, unsafe_allow_html=True)
 
 with c2:
-    # Lógica de color Anual: Si baja respecto al anterior, verde.
-    color_ann = "#4CAF50" if annual_prediction < base_annual else "#FF5252"
-    diff = annual_prediction - base_annual
+    color_a = "#4CAF50" if annual_prediction < base_annual else "#FF5252"
     st.markdown(f"""
-    <div class="card">
-        <div class="sub-kpi">IPC ANUAL PROYECTADO</div>
-        <div class="big-kpi" style="color:{color_ann}">{annual_prediction:.2f}%</div>
-        <div style="color:#666; margin-top:5px;">Variación: {diff:+.2f}%</div>
+    <div class="kpi-card">
+        <div class="kpi-lbl">IPC ANUAL PROYECTADO</div>
+        <div class="kpi-val" style="color:{color_a}">{annual_prediction:.2f}%</div>
+        <div class="kpi-sub">Objetivo: {base_annual}%</div>
     </div>
     """, unsafe_allow_html=True)
 
 with c3:
-    # Efecto Escalón
-    step_effect = monthly_prediction - old_monthly
-    color_step = "#4CAF50" if step_effect < 0 else "#FF5252"
+    step = monthly_prediction - old_monthly
+    color_s = "#2196F3"
     st.markdown(f"""
-    <div class="card">
-        <div class="sub-kpi">DINÁMICA DE FLUJO</div>
-        <div class="big-kpi" style="color:{color_step}">{step_effect:+.2f}%</div>
-        <div style="color:#666; margin-top:5px;">Entra vs Sale ({old_monthly}%)</div>
+    <div class="kpi-card">
+        <div class="kpi-lbl">EFECTO ESCALÓN</div>
+        <div class="kpi-val" style="color:{color_s}">{step:+.2f}%</div>
+        <div class="kpi-sub">Diferencial Entrada/Salida</div>
     </div>
     """, unsafe_allow_html=True)
 
 st.markdown("---")
 
-# --- ANÁLISIS DE CAUSALIDAD (WATERFALL LIMPIO) ---
-col_chart, col_data = st.columns([2, 1])
+# --- FILA 2: ANÁLISIS ESTRUCTURAL ---
+col_water, col_log = st.columns([2, 1])
 
-with col_chart:
-    st.subheader("¿Cómo se construye este dato?")
+with col_water:
+    st.subheader("🏗️ Arquitectura del Dato")
     
-    # Valores para el gráfico
-    v_base = base_seasonal
-    v_energy = energy_drift * W_ENERGY
-    v_food = food_drift * W_FOOD
-    v_core = core_drift * W_CORE
+    # Datos para Waterfall
+    y_vals = [base_val, drift_energy*W_ENERGY, drift_food*W_FOOD, drift_core*W_CORE, monthly_prediction]
+    x_labs = ["Base Histórica", "Shock Energía", "Shock Alimentos", "Ajuste Core", "TOTAL"]
+    texts = [f"{v:+.2f}" for v in y_vals]
     
     fig = go.Figure(go.Waterfall(
-        name = "IPC", orientation = "v",
+        name = "20", orientation = "v",
         measure = ["relative", "relative", "relative", "relative", "total"],
-        x = ["Base Estacional", "Shock Energía", "Shock Alimentos", "Ajuste Core", "PREDICCIÓN"],
-        textposition = "outside",
-        text = [f"{v_base:+.2f}", f"{v_energy:+.2f}", f"{v_food:+.2f}", f"{v_core:+.2f}", f"{monthly_prediction:+.2f}"],
-        y = [v_base, v_energy, v_food, v_core, monthly_prediction],
+        x = x_labs, y = y_vals, text = texts,
         connector = {"line":{"color":"#555"}},
         decreasing = {"marker":{"color":"#4CAF50"}},
         increasing = {"marker":{"color":"#FF5252"}},
         totals = {"marker":{"color":"#2196F3"}}
     ))
-    fig.update_layout(template="plotly_dark", height=400, margin=dict(t=30, b=20, l=20, r=20))
+    fig.update_layout(template="plotly_dark", height=400, title="Descomposición Vectorial", margin=dict(t=30))
     st.plotly_chart(fig, use_container_width=True)
 
-with col_data:
-    st.subheader("Datos de Mercado (Tiempo Real)")
-    for name, val in market_real.items():
-        color = "red" if val > 0 else "green"
-        st.markdown(f"""
-        <div style="padding:10px; border-bottom:1px solid #333;">
-            <span style="color:#aaa">{name}</span>
-            <span style="float:right; color:{color}; font-weight:bold;">{val:+.2f}%</span>
-        </div>
-        """, unsafe_allow_html=True)
-        
-    st.info("""
-    **Filosofía Oracle Zero:**
-    Partimos de la estacionalidad innegociable (Ej: Enero siempre baja por rebajas).
-    Solo sumamos presión si los mercados muestran anomalías reales hoy.
-    """)
+with col_log:
+    st.subheader("🛰️ Datos Detectados")
+    if st.session_state.get("scanned"):
+        logs = st.session_state.get("auto_logs", [])
+        if logs:
+            for l in logs:
+                st.markdown(f"""
+                <div class="log-entry">
+                    <span class="tag {l['tag']}">{l['src']}</span> 
+                    <span style="color:#AAA">{l['msg']}</span>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("Escaneo completado. Mercados estables.")
+    else:
+        st.warning("Pulsa 'ESCANEAR Y CALIBRAR' en el menú lateral para cargar datos reales.")
+
+# --- FILA 3: PROBABILIDAD ---
+st.markdown("---")
+st.subheader("🎯 Rango de Confianza (95%)")
+try:
+    fig_dist = ff.create_distplot([sims], ['Probabilidad'], bin_size=0.01, show_hist=False, show_rug=False, colors=['#00E676'])
+    fig_dist.add_vline(x=monthly_prediction, line_dash="dash", line_color="white", annotation_text="Estimación Central")
+    fig_dist.add_vrect(x0=p5, x1=p95, fillcolor="#00E676", opacity=0.1, line_width=0)
+    fig_dist.update_layout(template="plotly_dark", height=300, margin=dict(t=20, b=20))
+    st.plotly_chart(fig_dist, use_container_width=True)
+except:
+    st.error("Librería scipy necesaria para visualización avanzada.")
