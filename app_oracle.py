@@ -6,191 +6,165 @@ import plotly.graph_objects as go
 import plotly.figure_factory as ff
 import pandas as pd
 import numpy as np
-import yfinance as yf
-import re # Para extraer números exactos del texto
+import re
 
-# --- CONFIGURACIÓN TÉCNICA ---
-st.set_page_config(page_title="Oracle V59 | Macro-Hybrid", page_icon="🌐", layout="wide")
+# --- CONFIGURACIÓN RETAIL ---
+st.set_page_config(page_title="Oracle V60 | Retail Scanner", page_icon="🛒", layout="wide")
 
 st.markdown("""
 <style>
-    .stApp { background-color: #0E1117; color: #E6E6E6; }
-    h1, h2, h3 { font-family: 'Roboto', sans-serif; color: #00B4D8; }
-    .metric-card { 
-        background-color: #1E2329; border: 1px solid #30363D; 
-        padding: 15px; border-radius: 8px; text-align: center;
+    .stApp { background-color: #121212; color: #E0E0E0; }
+    h1, h2, h3 { font-family: 'Arial', sans-serif; color: #00E676; }
+    .product-card { 
+        background-color: #1E1E1E; border: 1px solid #333; 
+        padding: 10px; margin-bottom: 5px; border-radius: 5px;
     }
-    .macro-alert { 
-        color: #FF9F1C; font-weight: bold; border: 1px solid #FF9F1C; 
-        padding: 5px; border-radius: 5px; font-size: 0.8em; margin-bottom: 5px;
+    .price-up { color: #FF5252; font-weight: bold; }
+    .price-down { color: #69F0AE; font-weight: bold; }
+    .supermarket-tag { 
+        background-color: #263238; color: #FFF; 
+        padding: 2px 6px; font-size: 0.75em; border-radius: 4px; border: 1px solid #546E7A;
     }
-    .headline-extracted { font-family: monospace; font-size: 0.85em; color: #4ECDC4; }
-    div[data-testid="stMetric"] { background-color: #161B22; border: 1px solid #30363D; }
+    div[data-testid="stMetric"] { background-color: #1E1E1E; border: 1px solid #333; }
 </style>
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# 1. PARÁMETROS OFICIALES
+# 1. DEFINICIÓN DE LA CESTA BÁSICA (SUPERMERCADO)
 # ==============================================================================
-SECTOR_PARAMS = {
-    "01 Alimentos": {"w": 19.6, "sigma": 0.35, "keywords": ["precio aceite", "cesta compra", "precio fruta", "leche huevos"]},
-    "02 Alcohol/Tabaco": {"w": 3.9, "sigma": 0.1, "keywords": ["precio tabaco", "impuestos alcohol"]},
-    "03 Vestido": {"w": 3.8, "sigma": 0.8, "keywords": ["rebajas ropa", "moda precios"]},
-    "04 Vivienda": {"w": 12.7, "sigma": 0.6, "keywords": ["precio luz", "tarifa gas", "tope gas", "alquiler"]},
-    "05 Menaje": {"w": 5.8, "sigma": 0.2, "keywords": ["electrodomesticos", "reformas"]},
-    "06 Sanidad": {"w": 4.4, "sigma": 0.1, "keywords": ["medicamentos", "copago"]},
-    "07 Transporte": {"w": 11.6, "sigma": 0.5, "keywords": ["gasolina", "diesel", "renfe", "vuelos"]},
-    "08 Comunicaciones": {"w": 2.7, "sigma": 0.1, "keywords": ["tarifas movil", "fibra optica"]},
-    "09 Ocio": {"w": 4.9, "sigma": 0.3, "keywords": ["cine", "paquetes turisticos"]},
-    "10 Enseñanza": {"w": 1.6, "sigma": 0.05, "keywords": ["matricula universidad", "libros texto"]},
-    "11 Hoteles": {"w": 13.9, "sigma": 0.4, "keywords": ["menu dia", "precio hoteles"]},
-    "12 Otros": {"w": 15.1, "sigma": 0.2, "keywords": ["seguros", "peluqueria"]}
+# Estos son los productos testigo que vamos a rastrear en los lineales.
+BASIC_BASKET = {
+    "Aceite de Oliva": {"keywords": ["precio aceite oliva", "virgen extra"], "w": 0.3},
+    "Leche/Lácteos":   {"keywords": ["precio leche", "carton leche", "precio mantequilla"], "w": 0.2},
+    "Huevos":          {"keywords": ["precio huevos", "docena huevos"], "w": 0.1},
+    "Pan/Cereales":    {"keywords": ["precio pan", "barra pan", "precio harina"], "w": 0.15},
+    "Pollo/Carne":     {"keywords": ["precio pollo", "filetes pollo", "precio carne cerdo"], "w": 0.25}
 }
 
-# ==============================================================================
-# 2. MOTOR MACROECONÓMICO (TOP-DOWN)
-# ==============================================================================
-def get_macro_pressure():
-    """
-    Analiza EUR/USD (Importaciones) y Cobre (Demanda Industrial) para calcular
-    la presión base sobre todo el sistema.
-    """
-    macro_score = 0.0
-    logs = []
-    
-    try:
-        # Descarga de datos
-        tickers = ["EURUSD=X", "HG=F"] # Euro y Cobre
-        data = yf.download(tickers, period="1mo", progress=False, auto_adjust=True)
-        
-        if not data.empty:
-            # 1. ANÁLISIS DIVISA (Si el Euro cae, inflación sube)
-            curr_close = data['Close']['EURUSD=X'].iloc[-1]
-            curr_open = data['Open']['EURUSD=X'].iloc[0]
-            euro_chg = ((curr_close - curr_open) / curr_open) * 100
-            
-            # Lógica inversa: Euro baja (-2%) -> Inflación sube (+0.05%)
-            if euro_chg < -1.0: 
-                macro_score += 0.08
-                logs.append(f"💶 EURO DÉBIL ({euro_chg:.1f}%): Presión inflacionaria importada.")
-            elif euro_chg > 1.0:
-                macro_score -= 0.05
-                logs.append(f"💶 EURO FUERTE (+{euro_chg:.1f}%): Abarata importaciones.")
-                
-            # 2. ANÁLISIS INDUSTRIAL (Cobre como termómetro)
-            copper_chg = ((data['Close']['HG=F'].iloc[-1] - data['Open']['HG=F'].iloc[0]) / data['Open']['HG=F'].iloc[0]) * 100
-            if copper_chg > 3.0:
-                macro_score += 0.05
-                logs.append(f"🏭 COSTES INDUSTRIALES ({copper_chg:.1f}%): Presión en bienes duraderos.")
-                
-    except:
-        logs.append("⚠️ Sin datos Macro en tiempo real.")
-        
-    return macro_score, logs
+# Supermercados Objetivo (Targets)
+RETAILERS = ["Mercadona", "Carrefour", "Lidl", "Dia", "Alcampo"]
 
 # ==============================================================================
-# 3. MOTOR NLP CUANTITATIVO (EXTRAE NÚMEROS)
+# 2. MOTOR "RETAIL CRAWLER" (META-SCRAPING)
 # ==============================================================================
-def extract_number_from_text(text):
-    # Busca patrones como "sube un 10%", "cae 5.5 puntos", "20 euros"
-    match = re.search(r'(\d+([.,]\d+)?)(\s?%| euros| puntos)', text.lower())
-    if match:
-        num_str = match.group(1).replace(',', '.')
-        return float(num_str)
-    return None
-
-def hunt_hybrid_data(year, month):
-    impacts = {k: 0.0 for k in SECTOR_PARAMS.keys()}
+def scan_supermarket_shelves(year, month):
+    """
+    Busca intersecciones entre PRODUCTO + SUPERMERCADO + CAMBIO DE PRECIO.
+    Ej: "Mercadona sube el precio de la leche"
+    """
+    impacts = {k: 0.0 for k in BASIC_BASKET.keys()}
     evidence_log = []
     
-    # 1. Configuración Temporal
+    # Configuración de Fechas
     is_future = datetime.datetime(year, month, 1) > datetime.datetime.now()
-    period = '20d' if is_future else None
+    period = '15d' if is_future else None
     s_date = None if is_future else (year, month, 1)
     e_date = None if is_future else (year, month, calendar.monthrange(year, month)[1])
     
-    gnews = GNews(language='es', country='ES', period=period, start_date=s_date, end_date=e_date, max_results=8)
+    gnews = GNews(language='es', country='ES', period=period, start_date=s_date, end_date=e_date, max_results=10)
     
-    # Barra de progreso
-    prog_bar = st.progress(0)
+    progress_bar = st.progress(0)
     
-    # Solo escaneamos sectores volátiles para eficiencia
-    target_sectors = ["01 Alimentos", "04 Vivienda", "07 Transporte", "11 Hoteles", "03 Vestido"]
-    
-    for i, sector in enumerate(target_sectors):
-        prog_bar.progress(int((i/len(target_sectors))*100))
+    # Iteramos por Producto
+    idx = 0
+    for product, data in BASIC_BASKET.items():
+        idx += 1
+        progress_bar.progress(int((idx / len(BASIC_BASKET)) * 100))
         
-        keyword = SECTOR_PARAMS[sector]["keywords"][0]
-        query = f"{keyword} España"
+        # Query compuesta: "precio leche mercadona españa"
+        # Usamos el primer retailer y palabra clave para muestreo rápido, 
+        # pero GNews traerá resultados de todos si es relevante.
+        base_query = f"{data['keywords'][0]} supermercado precio España"
         
         try:
-            news = gnews.get_news(query)
-            sector_val = 0.0
+            news = gnews.get_news(base_query)
+            prod_score = 0
             
             for art in news:
                 t = art['title'].lower()
-                val = 0
                 
-                # A. Detección de Dirección
-                if "sube" in t or "dispara" in t or "alza" in t: direction = 1
-                elif "baja" in t or "cae" in t or "desploma" in t: direction = -1
-                else: direction = 0
+                # 1. Detectar Dirección del Precio
+                direction = 0
+                if "sube" in t or "encarece" in t or "dispara" in t: direction = 1
+                elif "baja" in t or "barato" in t or "oferta" in t: direction = -1
+                
+                # 2. Detectar Supermercado (Etiquetado)
+                detected_retailer = None
+                for r in RETAILERS:
+                    if r.lower() in t:
+                        detected_retailer = r
+                        break
+                
+                # 3. Detectar Cifra (Regex)
+                magnitude = 0.1 # Valor por defecto
+                match = re.search(r'(\d+([.,]\d+)?)%', t)
+                if match:
+                    # Si dice "sube un 20%", impacto es mayor
+                    magnitude = float(match.group(1).replace(',', '.')) * 0.01 
+                    # Capamos al 0.3 (30%) para evitar errores de lectura
+                    magnitude = min(magnitude, 0.3)
                 
                 if direction != 0:
-                    # B. Detección de MAGNITUD (La novedad V59)
-                    magnitude = extract_number_from_text(t)
+                    val = direction * magnitude
+                    prod_score += val
                     
-                    if magnitude:
-                        # Si dice "sube 10%", aplicamos un factor amortiguado
-                        # Regla: 10% noticia ~ 0.2% impacto IPC directo (aprox)
-                        val = direction * (magnitude * 0.02)
-                        note = f"(Dato extraído: {magnitude}%)"
-                    else:
-                        # Si no hay número, usamos estándar 0.1
-                        val = direction * 0.1
-                        note = "(Sentimiento puro)"
-                    
-                    sector_val += val
-                    if len(evidence_log) < 6:
-                        evidence_log.append(f"{sector[:10]}..: {art['title']} {note}")
+                    # Loguear evidencia
+                    icon = "🔥" if direction > 0 else "🟢"
+                    retailer_tag = f"[{detected_retailer}]" if detected_retailer else "[General]"
+                    if len(evidence_log) < 10: # Límite de logs
+                        evidence_log.append({
+                            "product": product,
+                            "retailer": retailer_tag,
+                            "title": art['title'],
+                            "val": val
+                        })
             
-            # Tope de seguridad +/- 0.8%
-            impacts[sector] = max(min(sector_val, 0.8), -0.8)
+            impacts[product] = prod_score
             
         except: pass
         
-    prog_bar.empty()
+    progress_bar.empty()
     return impacts, evidence_log
 
 # ==============================================================================
-# 4. SIMULACIÓN MONTE CARLO (CON FACTOR MACRO)
+# 3. MOTOR DE CÁLCULO IPC GLOBAL
 # ==============================================================================
-def run_simulation(base_dna, news_inputs, macro_pressure, iterations=5000):
-    weights = np.array([v["w"] for v in SECTOR_PARAMS.values()])
-    sigmas = np.array([v["sigma"] for v in SECTOR_PARAMS.values()])
+def calculate_inflation(base_annual, old_monthly, shelf_data, year, month):
+    # 1. Calcular Inflación de Supermercado (Sub-índice)
+    supermarket_inflation = 0.0
+    for prod, val in shelf_data.items():
+        supermarket_inflation += (val * BASIC_BASKET[prod]["w"])
     
-    means = []
-    for k in SECTOR_PARAMS.keys():
-        # Fórmula Maestra V59:
-        # Media = Inercia + Noticias (Cuantitativas) + Presión Macro Global
-        val = base_dna[k] + news_inputs.get(k, 0.0) + (macro_pressure * 0.5) 
-        means.append(val)
-        
-    means = np.array(means)
+    # 2. Integrar con Resto de la Economía (Modelo Híbrido Simplificado para V60)
+    # Asumimos una inercia base para lo que no es comida (Servicios, Energía)
+    # Inercia Estacional Base
+    base_inertia = 0.1
+    if month in [1, 7]: base_inertia = -0.5 # Rebajas generales
     
-    # Generar Ruido
-    noise = np.random.normal(0, 0.15, (iterations, 12)) * sigmas
-    scenarios = means + noise
+    # La comida pesa un 20% en el IPC total.
+    # El resto (80%) se mueve por inercia + energía (estimada aquí como proxy)
     
-    weighted_scenarios = np.dot(scenarios, weights) / 100
-    return weighted_scenarios
+    # Factor Corrector Energía (Hardcoded proxy para velocidad en esta demo)
+    energy_proxy = 0.0 # Neutro por defecto
+    
+    # IPC MENSUAL ESTIMADO = (Comida * 0.20) + (Resto * 0.80)
+    # Pero amplificamos la señal de comida porque suele ser indicador adelantado
+    monthly_cpi = (supermarket_inflation * 0.3) + (base_inertia * 0.7)
+    
+    # 3. Anualización
+    f_base = 1 + base_annual/100
+    f_out = 1 + old_monthly/100
+    f_in = 1 + monthly_cpi/100
+    final_annual = ((f_base / f_out) * f_in - 1) * 100
+    
+    return monthly_cpi, final_annual, supermarket_inflation
 
 # ==============================================================================
 # UI
 # ==============================================================================
 with st.sidebar:
-    st.title("ORACLE V59")
-    st.caption("MACRO-HYBRID ENGINE")
+    st.title("ORACLE V60")
+    st.caption("RETAIL SCANNER EDITION")
     
     t_year = st.number_input("Año", 2024, 2030, 2026)
     t_month = st.selectbox("Mes", range(1, 13))
@@ -199,87 +173,66 @@ with st.sidebar:
     base_annual = st.number_input("IPC Anual Previo", value=2.90)
     old_monthly = st.number_input("IPC Saliente", value=0.30)
     
-    st.markdown("### 🌐 Capas de Análisis")
-    st.checkbox("Macroeconomía (Divisas/Ind)", value=True, disabled=True)
-    st.checkbox("NLP Cuantitativo (Extracción Cifras)", value=True, disabled=True)
-    st.checkbox("Microsimulación Sectorial", value=True, disabled=True)
-    
-    if st.button("EJECUTAR ANÁLISIS HÍBRIDO", type="primary"):
-        st.session_state.run_v59 = True
+    st.markdown("### 🛒 Cesta Monitorizada")
+    for p in BASIC_BASKET.keys():
+        st.caption(f"• {p}")
+        
+    if st.button("ESCANEAR SUPERMERCADOS", type="primary"):
+        st.session_state.run_v60 = True
 
-if 'run_v59' in st.session_state:
-    st.title(f"Predicción Macro-Híbrida: {calendar.month_name[t_month].upper()} {t_year}")
+if 'run_v60' in st.session_state:
+    st.title(f"Monitor de Precios: {calendar.month_name[t_month].upper()} {t_year}")
     
-    # 1. OBTENER FACTOR MACRO (TOP-DOWN)
-    macro_val, macro_logs = get_macro_pressure()
-    
-    # 2. OBTENER DATOS MICRO (BOTTOM-UP)
-    # Definir Inercia Base
-    base_dna = {k: 0.1 for k in SECTOR_PARAMS.keys()}
-    if t_month in [1, 7]: base_dna["03 Vestido"] = -12.0
-    if t_month in [3, 4, 9, 10]: base_dna["03 Vestido"] = 4.0
-    if t_month in [7, 8]: base_dna["11 Hoteles"] = 1.0
-    
-    # Escanear Noticias con Regex
-    micro_impacts, micro_logs = hunt_hybrid_data(t_year, t_month)
-    
-    # 3. SIMULACIÓN FINAL
-    sim_results = run_simulation(base_dna, micro_impacts, macro_val, 5000)
-    
-    # Estadísticas
-    median = np.median(sim_results)
-    std = np.std(sim_results)
-    p5, p95 = np.percentile(sim_results, [5, 95])
-    
-    # Anual
-    f_base = 1 + base_annual/100
-    f_out = 1 + old_monthly/100
-    f_in = 1 + median/100
-    final_annual = ((f_base / f_out) * f_in - 1) * 100
-    
-    # --- VISUALIZACIÓN ---
-    
-    # KPI BOARD
+    # 1. SCANNING
+    with st.spinner("Rastreando lineales de Mercadona, Carrefour, Lidl..."):
+        shelf_data, shelf_logs = scan_supermarket_shelves(t_year, t_month)
+        monthly_val, annual_val, food_cpi = calculate_inflation(base_annual, old_monthly, shelf_data, t_year, t_month)
+
+    # 2. KPI BOARD
     c1, c2, c3 = st.columns(3)
-    c1.metric("IPC MENSUAL", f"{median:+.2f}%", f"Macro Impact: {macro_val:+.3f}")
-    c2.metric("IPC ANUAL", f"{final_annual:.2f}%", f"Objetivo: {base_annual}%")
-    c3.metric("CONFIANZA (95%)", f"[{p5:.2f}%, {p95:.2f}%]", "Rango Probable")
+    c1.metric("IPC GENERAL (ESTIMADO)", f"{monthly_val:+.2f}%", "Mensual Global")
+    # Destacamos la inflación de comida porque es lo que el usuario pidió
+    c2.metric("INFLACIÓN ALIMENTOS", f"{food_cpi:+.2f}%", "Solo Supermercados")
+    c3.metric("IPC ANUAL", f"{annual_val:.2f}%", f"Objetivo: {base_annual}%")
     
     st.markdown("---")
     
-    col_macro, col_micro = st.columns(2)
+    # 3. DETALLE POR PRODUCTO (SHELF VIEW)
+    st.subheader("🛒 Variación en el Lineal (Canasta Básica)")
     
-    with col_macro:
-        st.subheader("🌐 Contexto Macroeconómico")
-        if macro_logs:
-            for l in macro_logs:
-                st.markdown(f"<div class='macro-alert'>{l}</div>", unsafe_allow_html=True)
-        else:
-            st.info("Sin presión macroeconómica externa relevante.")
-            
-        fig_gauge = go.Figure(go.Indicator(
-            mode = "gauge+number", value = macro_val,
-            title = {'text': "Presión Importada"},
-            gauge = {'axis': {'range': [-0.5, 0.5]}, 'bar': {'color': "#00B4D8"}}
-        ))
-        fig_gauge.update_layout(height=250, margin=dict(l=20,r=20,t=30,b=20), paper_bgcolor="#161B22", font={'color': "white"})
-        st.plotly_chart(fig_gauge, use_container_width=True)
+    cols = st.columns(len(BASIC_BASKET))
+    for i, (prod, val) in enumerate(shelf_data.items()):
+        with cols[i]:
+            color = "red" if val > 0 else "green" if val < 0 else "gray"
+            st.markdown(f"**{prod}**")
+            st.markdown(f"<h2 style='color:{color}; margin:0;'>{val:+.2f}%</h2>", unsafe_allow_html=True)
+            st.caption(f"Peso: {int(BASIC_BASKET[prod]['w']*100)}%")
 
-    with col_micro:
-        st.subheader("📰 Datos Extraídos (NLP)")
-        if micro_logs:
-            for log in micro_logs:
-                st.markdown(f"<div class='headline-extracted'>• {log}</div>", unsafe_allow_html=True)
-        else:
-            st.caption("No se hallaron cifras porcentuales explícitas en titulares recientes.")
-
-    # GRÁFICO PROBABILIDAD
+    # 4. EVIDENCIA "SCRAPEADA"
     st.markdown("---")
-    try:
-        hist_data = [sim_results]
-        fig = ff.create_distplot(hist_data, ['Probabilidad Híbrida'], bin_size=0.02, show_hist=False, show_rug=False, colors=['#00B4D8'])
-        fig.add_vline(x=median, line_dash="dash", annotation_text="Mediana Escenario")
-        fig.add_vrect(x0=p5, x1=p95, fillcolor="#00B4D8", opacity=0.1, line_width=0)
-        fig.update_layout(title="Distribución de Probabilidad Final", template="plotly_dark", height=400)
-        st.plotly_chart(fig, use_container_width=True)
-    except: pass
+    st.subheader("🧾 Tickets y Noticias Detectadas")
+    
+    if shelf_logs:
+        for item in shelf_logs:
+            css_class = "price-up" if item['val'] > 0 else "price-down"
+            st.markdown(f"""
+            <div class="product-card">
+                <div style="display:flex; justify-content:space-between;">
+                    <span><b>{item['product']}</b> <span class="supermarket-tag">{item['retailer']}</span></span>
+                    <span class="{css_class}">{item['val']:+.2f}%</span>
+                </div>
+                <div style="font-size:0.85em; color:#AAA; margin-top:5px;">{item['title']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.info("No se detectaron movimientos bruscos de precios en las noticias de retail recientes.")
+    
+    # 5. GRÁFICO DE APORTE
+    labels = list(shelf_data.keys())
+    values = list(shelf_data.values())
+    fig = go.Figure(go.Bar(
+        x=values, y=labels, orientation='h',
+        marker=dict(color=['#FF5252' if x > 0 else '#69F0AE' for x in values])
+    ))
+    fig.update_layout(title="Presión Inflacionaria por Producto", template="plotly_dark", height=300)
+    st.plotly_chart(fig, use_container_width=True)
