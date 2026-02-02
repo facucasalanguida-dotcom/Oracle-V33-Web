@@ -2,6 +2,5 @@ streamlit
 yfinance
 gnews
 pandas
-matplotlib
-lxml
+plotly
 altair<5
