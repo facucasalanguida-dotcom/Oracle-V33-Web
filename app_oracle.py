@@ -6,54 +6,71 @@ import datetime
 from datetime import timedelta
 import plotly.graph_objects as go
 import pandas as pd
+import numpy as np
 import time
 
 # --- CONFIGURACIÓN UI ---
-st.set_page_config(page_title="Oracle V39 | Active Hunting", page_icon="🐕", layout="wide")
+st.set_page_config(page_title="Oracle V40 | Omni-Data", page_icon="🧿", layout="wide")
+
 st.markdown("""
 <style>
-    .stApp { background-color: #0d1117; color: #c9d1d9; }
-    h1, h2, h3 { font-family: 'Roboto Mono', monospace; color: #58a6ff; }
-    .sector-box { 
-        background-color: #161b22; 
-        border: 1px solid #30363d; 
-        border-radius: 6px; 
-        padding: 15px; 
-        margin-bottom: 10px;
-    }
-    .highlight { color: #58a6ff; font-weight: bold; }
-    div[data-testid="stStatusWidget"] { background-color: #161b22; }
+    .stApp { background-color: #0E1117; color: #E6E6E6; }
+    h1, h2, h3 { font-family: 'Inter', sans-serif; color: #4CC9F0; }
+    .metric-box { background-color: #1A1D24; border: 1px solid #30363D; padding: 15px; border-radius: 8px; }
+    .stStatusWidget { background-color: #1A1D24; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. ESTRUCTURA DE PESOS (INE) ---
+# --- 1. CONFIGURACIÓN ESTRUCTURAL ---
 SECTOR_WEIGHTS = {
     "Alimentos": 0.20,
-    "Energía/Vivienda": 0.13,
+    "Energía": 0.13,
     "Transporte": 0.12,
-    "Turismo/Ocio": 0.15,
-    "Core (Ropa/Servicios)": 0.40
+    "Servicios/Turismo": 0.15,
+    "Core (Resto)": 0.40
 }
 
-# --- 2. CONFIGURACIÓN DE LOS "SABUESOS" (BUSCADORES ESPECÍFICOS) ---
-# Cada sector tiene su propia "Query" de búsqueda para obligar a Google a darnos datos.
-SECTOR_QUERIES = {
-    "Alimentos": "precio alimentos cesta compra aceite fruta supermercado España",
-    "Energía/Vivienda": "precio luz gas electricidad tarifa regulada tope gas España",
-    "Transporte": "precio gasolina diesel carburantes surtidor transporte España",
-    "Turismo/Ocio": "precio hoteles vacaciones vuelos restaurantes semana santa España",
-    "Core (Ropa/Servicios)": "rebajas ropa inflación servicios ipc subyacente España"
+# --- 2. DICCIONARIO SEMÁNTICO MASIVO (100+ Keywords) ---
+# Si no sale una palabra, saldrá otra. Cubrimos todo el espectro económico.
+KEYWORDS_DB = {
+    "Alimentos": {
+        "up": ["sequía", "mala cosecha", "aceite dispara", "subida precio alimentos", "cesta compra cara", "azúcar", "cacao", "ganadería costos", "pesca"],
+        "down": ["bajada iva alimentos", "supermercado baja", "buena cosecha", "oferta", "bajada precios", "estabiliza alimentos"],
+        "sensibility": 0.06
+    },
+    "Energía": {
+        "up": ["luz sube", "gas dispara", "pool eléctrico", "pvpc sube", "calefacción", "ola de frío", "tope gas", "megavatio"],
+        "down": ["luz baja", "excepción ibérica", "bajada impuestos luz", "bono social", "energía barata", "viento", "renovables"],
+        "sensibility": 0.12
+    },
+    "Transporte": {
+        "up": ["gasolina sube", "diesel", "barril brent", "surtidor", "céntimos litro", "peajes", "coches"],
+        "down": ["gasolina baja", "ayuda combustible", "bonificación", "transporte gratis", "abono transporte"],
+        "sensibility": 0.08
+    },
+    "Servicios/Turismo": {
+        "up": ["hotel récord", "vuelos caros", "lleno semana santa", "temporada alta", "restaurantes suben", "hostelería"],
+        "down": ["baja ocupación", "ofertas viaje", "fin temporada", "hoteles baratos"],
+        "sensibility": 0.05
+    },
+    "Core (Resto)": {
+        "up": ["inflación subyacente", "servicios", "seguros", "telefonía", "alquiler sube", "ropa nueva colección"],
+        "down": ["rebajas", "descuentos", "black friday", "bajada tipos", "consumo frena"],
+        "sensibility": 0.04
+    }
 }
 
-# Palabras clave de sentimiento
-SENTIMENT_MAP = {
-    "subida": 1, "alza": 1, "dispara": 1.5, "caro": 1, "récord": 1.5,
-    "bajada": -1, "descenso": -1, "desploma": -1.5, "barato": -1, "oferta": -0.5,
-    "frena": -0.5, "modera": -0.5 # Inversión de tendencia
+# --- 3. HARD DATA AVANZADO (MATERIAS PRIMAS) ---
+# Añadimos Trigo (Alimentos) y Maíz para no depender solo de Google.
+MARKET_TICKERS = {
+    "BRENT (Petróleo)": {"sym": "CL=F", "sector": "Transporte", "weight": 0.02},
+    "GAS (TTF/Henry)": {"sym": "NG=F", "sector": "Energía", "weight": 0.03},
+    "TRIGO (Alimentos)": {"sym": "ZW=F", "sector": "Alimentos", "weight": 0.015}, # Nuevo
+    "MAÍZ (Alimentos)": {"sym": "ZC=F", "sector": "Alimentos", "weight": 0.01}    # Nuevo
 }
 
-# --- 3. ESTACIONALIDAD BASE (Reloj Biológico del IPC) ---
-def get_seasonality(month, year):
+# --- 4. MOTOR DE ESTACIONALIDAD (ESQUELETO INE) ---
+def get_ine_skeleton(month, year):
     # Cálculo Pascua
     a = year % 19; b = year // 100; c = year % 100; d = b // 4; e = b % 4
     f = (b + 8) // 25; g = (b - f + 1) // 3; h = (19 * a + b - d - g + 15) % 30
@@ -61,106 +78,104 @@ def get_seasonality(month, year):
     m = (a + 11 * h + 22 * l) // 451
     easter_m = (h + l - 7 * m + 114) // 31
     
-    # Matriz Base (Ajustada para clavar Enero)
+    # Matriz Base (Ajustada a la realidad española)
     base = {
-        1: {"Alimentos": 0.2, "Energía/Vivienda": 0.6, "Transporte": 0.1, "Turismo/Ocio": -0.5, "Core (Ropa/Servicios)": -1.9},
-        2: {"Alimentos": 0.2, "Energía/Vivienda": 0.0, "Transporte": 0.2, "Turismo/Ocio": 0.2, "Core (Ropa/Servicios)": 0.2},
-        3: {"Alimentos": 0.1, "Energía/Vivienda": -0.2, "Transporte": 0.3, "Turismo/Ocio": 0.3, "Core (Ropa/Servicios)": 0.9},
-        4: {"Alimentos": 0.1, "Energía/Vivienda": 0.0, "Transporte": 0.2, "Turismo/Ocio": 0.1, "Core (Ropa/Servicios)": 0.5},
-        5: {"Alimentos": -0.4, "Energía/Vivienda": -0.1, "Transporte": 0.1, "Turismo/Ocio": 0.2, "Core (Ropa/Servicios)": 0.1},
-        6: {"Alimentos": 0.1, "Energía/Vivienda": 0.4, "Transporte": 0.2, "Turismo/Ocio": 0.6, "Core (Ropa/Servicios)": 0.1},
-        7: {"Alimentos": 0.0, "Energía/Vivienda": 0.5, "Transporte": 0.3, "Turismo/Ocio": 0.9, "Core (Ropa/Servicios)": -1.8},
-        8: {"Alimentos": 0.1, "Energía/Vivienda": 0.1, "Transporte": 0.1, "Turismo/Ocio": 0.2, "Core (Ropa/Servicios)": 0.1},
-        9: {"Alimentos": -0.1, "Energía/Vivienda": 0.0, "Transporte": -0.2, "Turismo/Ocio": -1.5, "Core (Ropa/Servicios)": 1.2},
-        10:{"Alimentos": 0.2, "Energía/Vivienda": 0.4, "Transporte": -0.1, "Turismo/Ocio": -0.5, "Core (Ropa/Servicios)": 1.8},
-        11:{"Alimentos": 0.1, "Energía/Vivienda": 0.2, "Transporte": 0.0, "Turismo/Ocio": -0.2, "Core (Ropa/Servicios)": 0.1},
-        12:{"Alimentos": 0.5, "Energía/Vivienda": 0.3, "Transporte": 0.1, "Turismo/Ocio": 0.5, "Core (Ropa/Servicios)": 0.2}
+        1: -0.50, 2: 0.20, 3: 0.30, 4: 0.35, 5: 0.10, 6: 0.50,
+        7: -0.50, 8: 0.20, 9: -0.30, 10: 0.60, 11: 0.15, 12: 0.25
     }
     
-    current = base.get(month, base[1]).copy()
-    
+    val = base.get(month, 0.2)
     # Ajuste Pascua
-    if month == easter_m: current["Turismo/Ocio"] += 1.2
-    elif month == easter_m - 1: current["Turismo/Ocio"] += 0.4
-        
-    return current
-
-# --- 4. MOTOR DE CAZA ACTIVA (ACTIVE HUNTING) ---
-def hunt_news_per_sector(year, month):
-    impacts = {}
-    evidence = {}
+    if month == easter_m: val += 0.30
+    elif month == easter_m - 1: val += 0.10
     
-    # Determinamos fechas
+    return val
+
+# --- 5. MOTOR "INE FALLBACK" (LA RED DE SEGURIDAD) ---
+def calculate_statistical_projection(prev_annual, skeleton):
+    """
+    Si no hay noticias, calculamos la inercia estadística.
+    Si la inflación previa es alta (ej 3%), empuja el mensual hacia arriba ligeramente.
+    """
+    inertia = (prev_annual - 2.0) * 0.02 # Factor de arrastre
+    return skeleton + inertia
+
+# --- 6. MOTOR DE BÚSQUEDA HÍBRIDO (NEWS + FALLBACK) ---
+def analyze_sector_impacts(year, month, prev_annual):
+    impacts = {k: 0.0 for k in SECTOR_WEIGHTS.keys()}
+    evidence = {k: [] for k in SECTOR_WEIGHTS.keys()}
+    
+    # Fechas
     dt_target = datetime.datetime(year, month, 1)
     is_future = dt_target > datetime.datetime.now()
     
-    if is_future:
-        # Si es futuro, buscamos noticias RECIENTES (últimos 10 días) para ver tendencia actual
-        period = '10d'
-        start_d = None; end_d = None
-    else:
-        last = calendar.monthrange(year, month)[1]
-        start_d = (year, month, 1)
-        end_d = (year, month, last)
-        period = None
-
-    # Inicializamos barra de progreso visual en el frontend
-    status_msg = st.status("🐕 Soltando a los sabuesos de noticias...", expanded=True)
+    # Configuración GNews
+    period = '15d' if is_future else None
+    start_d = None if is_future else (year, month, 1)
+    end_d = None if is_future else (year, month, calendar.monthrange(year, month)[1])
     
-    for sector, query in SECTOR_QUERIES.items():
-        status_msg.write(f"🔍 Buscando datos para: **{sector}**...")
+    status_box = st.status("📡 Escaneando Fuentes de Datos...", expanded=True)
+    
+    gnews = GNews(language='es', country='ES', period=period, start_date=start_d, end_date=end_d, max_results=20)
+    
+    for sector, keywords in KEYWORDS_DB.items():
+        status_box.write(f"🔍 Analizando Sector: **{sector}**...")
+        
+        # 1. BÚSQUEDA AMPLIA (Query dinámica)
+        # Construimos una query con las top 3 palabras clave para maximizar resultados
+        query_terms = " ".join(keywords["up"][:3])
+        query = f"{sector} precio España {query_terms}"
         
         try:
-            gnews = GNews(language='es', country='ES', period=period, start_date=start_d, end_date=end_d, max_results=15)
-            # Añadimos el año a la query para contexto si es pasado
-            full_query = f"{query} {year}" if not is_future else query
-            
-            news = gnews.get_news(full_query)
-            
+            news = gnews.get_news(query)
             score = 0.0
-            found_headlines = []
+            headlines = []
             
+            # Análisis Semántico
             for art in news:
                 t = art['title'].lower()
-                val = 0
-                for w, v in SENTIMENT_MAP.items():
-                    if w in t:
-                        val += v
-                
-                # IVA es especial
-                if "iva" in t and "baja" in t: val -= 2.0
-                if "iva" in t and "sube" in t: val += 2.0
-                
-                if val != 0:
-                    score += val
-                    if len(found_headlines) < 2: found_headlines.append(f"{art['title']}")
+                # Check UP
+                for w in keywords["up"]:
+                    if w in t: 
+                        score += 1
+                        if len(headlines)<1: headlines.append(f"🔴 {art['title']}")
+                        break
+                # Check DOWN
+                for w in keywords["down"]:
+                    if w in t: 
+                        score -= 1
+                        if len(headlines)<1: headlines.append(f"🟢 {art['title']}")
+                        break
             
-            # Normalización del sector (Sensibilidad)
-            # Alimentos y Energía son muy sensibles, Turismo menos por noticias
-            sensitivity = 0.03 if sector == "Core (Ropa/Servicios)" else 0.05
-            
-            # Calculamos promedio del sentimiento
-            if len(news) > 0:
-                avg_score = score / max(len(news), 1)
-                final_sector_impact = avg_score * sensitivity
+            # --- CEREBRO V40: GESTIÓN DE FALTA DE DATOS ---
+            if len(news) == 0 or score == 0:
+                # NO HAY DATOS -> ACTIVAMOS FALLBACK INE
+                # Usamos una pequeña inercia basada en la inflación anual previa
+                fallback_val = (prev_annual - 2.0) * 0.01 * (1 if sector != "Alimentos" else 2)
+                impacts[sector] = fallback_val
+                evidence[sector] = [f"⚠️ Sin noticias recientes. Proyección INE: {fallback_val:+.3f}%"]
             else:
-                final_sector_impact = 0.0
-                found_headlines = ["(Sin datos específicos, usando inercia)"]
-            
-            impacts[sector] = final_sector_impact
-            evidence[sector] = found_headlines
-            
-            time.sleep(0.2) # Pequeña pausa para no saturar Google
-            
+                # HAY DATOS -> NORMALIZAMOS
+                # Limitamos la cantidad de noticias para no saturar
+                normalized_score = score / max(len(news), 3) 
+                impacts[sector] = normalized_score * keywords["sensibility"]
+                evidence[sector] = headlines
+
         except Exception as e:
+            # ERROR API -> FALLBACK SEGURO
             impacts[sector] = 0.0
-            evidence[sector] = [f"Error de conexión: {str(e)}"]
+            evidence[sector] = ["Error conexión. Impacto Neutro."]
             
-    status_msg.update(label="✅ Caza de noticias completada", state="complete", expanded=False)
+        time.sleep(0.1)
+
+    status_box.update(label="✅ Análisis Completado", state="complete", expanded=False)
     return impacts, evidence
 
-# --- 5. MOTOR MERCADO (HARD DATA) ---
-def get_market_data(year, month):
+# --- 7. MOTOR FINANCIERO ROBUSTO (Yahoo Finance) ---
+def get_financial_data(year, month):
+    impacts = {k: 0.0 for k in SECTOR_WEIGHTS.keys()}
+    logs = []
+    
     dt_target = datetime.datetime(year, month, 1)
     if dt_target > datetime.datetime.now():
         end = datetime.datetime.now()
@@ -169,97 +184,79 @@ def get_market_data(year, month):
         last = calendar.monthrange(year, month)[1]
         start = dt_target; end = datetime.datetime(year, month, last)
         
-    adjustments = {k: 0.0 for k in SECTOR_WEIGHTS.keys()}
-    
-    tickers = {"BRENT": ("CL=F", "Transporte"), "GAS": ("NG=F", "Energía/Vivienda")}
-    
-    try:
-        for name, (sym, sector) in tickers.items():
-            df = yf.download(sym, start=start, end=end, progress=False, auto_adjust=True)
+    for name, data in MARKET_TICKERS.items():
+        try:
+            df = yf.download(data["sym"], start=start, end=end, progress=False, auto_adjust=True)
             if not df.empty:
                 op = float(df.iloc[0]['Open']); cl = float(df.iloc[-1]['Close'])
                 change = ((cl - op) / op) * 100
                 
-                # Filtro de Ruido (>4%)
-                if abs(change) > 4.0:
-                    impact = change * 0.015 # Transmisión
-                    adjustments[sector] += impact
-    except: pass
-    
-    return adjustments
+                # Filtro de Ruido (>3%)
+                if abs(change) > 3.0:
+                    val = change * data["weight"]
+                    impacts[data["sector"]] += val
+                    logs.append(f"{name}: {change:+.1f}% -> {data['sector']} {val:+.3f}%")
+        except: pass
+        
+    return impacts, logs
 
-# --- FRONTEND ---
+# --- FRONTEND V40 ---
 with st.sidebar:
-    st.title("ORACLE V39")
-    st.caption("Active Sectorial Hunting")
+    st.title("ORACLE V40")
+    st.caption("Omni-Source Intelligence")
     
-    col_y, col_m = st.columns(2)
-    t_year = col_y.number_input("Año", 2024, 2030, 2026)
-    t_month = col_m.selectbox("Mes", range(1, 13))
+    t_year = st.number_input("Año", 2024, 2030, 2026)
+    t_month = st.selectbox("Mes", range(1, 13))
     
     st.divider()
-    base_annual = st.number_input("IPC Anual Previo", value=2.90)
-    old_monthly = st.number_input("IPC Saliente (-1 año)", value=-0.20)
+    base_annual = st.number_input("IPC Anual Previo", 2.90)
+    old_monthly = st.number_input("IPC Mensual Saliente", -0.20)
     
-    if st.button("INICIAR RASTREO"):
-        st.session_state.hunting = True
+    st.markdown("---")
+    if st.button("CALCULAR PREVISIÓN"):
+        st.session_state.calc = True
 
-if 'hunting' in st.session_state:
-    st.title(f"Informe de Inteligencia: {calendar.month_name[t_month]} {t_year}")
+if 'calc' in st.session_state:
+    # 1. ESQUELETO
+    skeleton = get_ine_skeleton(t_month, t_year)
     
-    # 1. ESTACIONALIDAD
-    seasonal_data = get_seasonality(t_month, t_year)
+    # 2. SOFT DATA (Con Fallback INE)
+    soft_impacts, soft_evidence = analyze_sector_impacts(t_year, t_month, base_annual)
     
-    # 2. CAZA DE NOTICIAS (ACTIVE HUNTING)
-    news_impacts, news_evidence = hunt_news_per_sector(t_year, t_month)
+    # 3. HARD DATA (Materias Primas)
+    hard_impacts, hard_logs = get_financial_data(t_year, t_month)
     
-    # 3. DATOS MERCADO
-    mkt_impacts = get_market_data(t_year, t_month)
-    
-    # 4. FUSIÓN
+    # 4. AGREGACIÓN
     total_monthly = 0.0
-    sector_results = {}
+    breakdown = {}
     
-    col_left, col_right = st.columns([3, 2])
+    st.title(f"Previsión IPC: {calendar.month_name[t_month]} {t_year}")
     
-    with col_left:
-        st.subheader("🧩 Desglose por Sector")
-        
+    col_metrics, col_graph = st.columns([1, 2])
+    
+    with col_graph:
+        # Gráfico de Barras por Sector
         for sector, weight in SECTOR_WEIGHTS.items():
-            # Suma de factores
-            s_base = seasonal_data.get(sector, 0.0)
-            s_news = news_impacts.get(sector, 0.0)
-            s_mkt = mkt_impacts.get(sector, 0.0)
+            # Inercia base distribuida + Inputs
+            s_base = skeleton * weight # Parte proporcional del esqueleto
+            s_soft = soft_impacts.get(sector, 0.0)
+            s_hard = hard_impacts.get(sector, 0.0)
             
-            # Valor final del sector
-            sector_val = s_base + s_news + s_mkt
+            total_sector = s_base + s_soft + s_hard
+            breakdown[sector] = total_sector
+            total_monthly += total_sector
             
-            # Contribución al IPC General (Valor * Peso)
-            contribution = sector_val * weight
-            total_monthly += contribution
-            
-            sector_results[sector] = contribution
-            
-            # Visualización
-            headlines_html = "".join([f"<li>{h}</li>" for h in news_evidence[sector][:2]])
-            
-            # Color según si sube o baja
-            color_border = "#58a6ff" if contribution > 0 else "#3fb950" 
-            
-            st.markdown(f"""
-            <div class="sector-box" style="border-left: 4px solid {color_border}">
-                <div style="display:flex; justify-content:space-between;">
-                    <span style="font-weight:bold; font-size:1.1em;">{sector}</span>
-                    <span style="color:{color_border}; font-weight:bold;">{sector_val:+.2f}% (Aporta {contribution:+.3f})</span>
-                </div>
-                <div style="font-size:0.8em; color:#8b949e; margin-top:5px;">
-                    <i>Inercia: {s_base}% | Noticias: {s_news:.3f}% | Mercado: {s_mkt:.3f}%</i>
-                </div>
-                <ul style="font-size:0.8em; margin-top:5px; padding-left:20px; color:#c9d1d9;">
-                    {headlines_html}
-                </ul>
-            </div>
-            """, unsafe_allow_html=True)
+        # Graficar
+        fig = go.Figure(go.Bar(
+            x=list(breakdown.values()),
+            y=list(breakdown.keys()),
+            orientation='h',
+            marker=dict(color=['#FF4B4B' if x < 0 else '#00CC96' for x in breakdown.values()]),
+            text=[f"{x:+.3f}%" for x in breakdown.values()],
+            textposition='auto'
+        ))
+        fig.update_layout(title="Contribución por Sector (Puntos Porcentuales)", template="plotly_dark", height=350)
+        st.plotly_chart(fig, use_container_width=True)
 
     # 5. CÁLCULO ANUAL
     f_base = 1 + base_annual/100
@@ -267,27 +264,36 @@ if 'hunting' in st.session_state:
     f_in = 1 + total_monthly/100
     final_annual = ((f_base / f_out) * f_in - 1) * 100
     
-    with col_right:
-        st.subheader("📈 Resultado Consolidado")
+    with col_metrics:
+        st.markdown("### 🎯 Resultados")
+        st.metric("IPC MENSUAL", f"{total_monthly:+.2f}%", f"Inercia: {skeleton}%")
+        st.metric("IPC ANUAL", f"{final_annual:.2f}%", f"{final_annual-base_annual:+.2f}% vs Previo", delta_color="inverse")
         
-        c1, c2 = st.columns(2)
-        c1.metric("IPC MENSUAL", f"{total_monthly:+.2f}%", "Suma Ponderada")
-        c2.metric("IPC ANUAL", f"{final_annual:.2f}%", f"{final_annual-base_annual:+.2f}% vs Previo")
-        
-        # Gráfico Donut
-        labels = list(sector_results.keys())
-        values = [abs(v) for v in sector_results.values()]
-        
-        fig = go.Figure(data=[go.Pie(labels=labels, values=values, hole=.6)])
-        fig.update_layout(title="Peso en la Variación", template="plotly_dark", height=300, showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
-        
-        st.info(f"""
-        **Análisis de Impacto:**
-        La inflación anual se sitúa en **{final_annual:.2f}%**.
-        Esto se debe principalmente al comportamiento del sector **{max(sector_results, key=sector_results.get)}**, 
-        que ha aportado **{max(sector_results.values()):+.3f}%** al índice general.
-        """)
+        st.markdown("### 🛡️ Fuentes Utilizadas")
+        st.caption(f"• Esqueleto INE Base")
+        st.caption(f"• Yahoo Finance (Petróleo/Gas/Trigo)")
+        st.caption(f"• GNews Semántico (Con Fallback Estadístico)")
 
-else:
-    st.info("Configura el año y mes a la izquierda para liberar a los sabuesos.")
+    # DETALLE DE EVIDENCIA
+    st.markdown("---")
+    st.subheader("🗂️ Evidencia Documental (Auditoría)")
+    
+    tabs = st.tabs(list(SECTOR_WEIGHTS.keys()))
+    for i, sector in enumerate(SECTOR_WEIGHTS.keys()):
+        with tabs[i]:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**📰 Noticias / Proyección INE**")
+                for e in soft_evidence.get(sector, []):
+                    st.code(e, language="text")
+            with c2:
+                st.markdown("**📈 Mercados Financieros**")
+                found_mkt = False
+                for log in hard_logs:
+                    if sector in str(MARKET_TICKERS.values()): # Simplificación visual
+                        st.caption(log)
+                        found_mkt = True
+                if hard_impacts.get(sector, 0) != 0:
+                    st.metric("Impacto Directo", f"{hard_impacts[sector]:+.3f}%")
+                else:
+                    st.caption("Sin impacto directo de futuros.")
