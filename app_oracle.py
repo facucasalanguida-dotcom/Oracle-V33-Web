@@ -6,149 +6,161 @@ import datetime
 from datetime import timedelta
 import plotly.graph_objects as go
 import pandas as pd
+import time
 
 # --- CONFIGURACIÓN UI ---
-st.set_page_config(page_title="Oracle V38 | Sectorial AI", page_icon="🧬", layout="wide")
+st.set_page_config(page_title="Oracle V39 | Active Hunting", page_icon="🐕", layout="wide")
 st.markdown("""
 <style>
-    .stApp { background-color: #080808; color: #e0e0e0; }
-    h1, h2, h3 { font-family: 'Segoe UI', sans-serif; color: #4facfe; }
-    div[data-testid="stMetric"] { background-color: #1a1a1a; border: 1px solid #333; border-radius: 8px; }
-    .sector-card { padding: 10px; background-color: #121212; border-left: 3px solid #4facfe; margin-bottom: 5px; }
+    .stApp { background-color: #0d1117; color: #c9d1d9; }
+    h1, h2, h3 { font-family: 'Roboto Mono', monospace; color: #58a6ff; }
+    .sector-box { 
+        background-color: #161b22; 
+        border: 1px solid #30363d; 
+        border-radius: 6px; 
+        padding: 15px; 
+        margin-bottom: 10px;
+    }
+    .highlight { color: #58a6ff; font-weight: bold; }
+    div[data-testid="stStatusWidget"] { background-color: #161b22; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. CONFIGURACIÓN DE PESOS INE (La Estructura Real del País) ---
-# Estos son los pesos oficiales aproximados del IPC de España.
+# --- 1. ESTRUCTURA DE PESOS (INE) ---
 SECTOR_WEIGHTS = {
-    "Alimentos": 0.20,      # 20% del gasto
-    "Energía/Vivienda": 0.13, # 13% (Luz, Gas, Agua)
-    "Transporte": 0.12,     # 12% (Gasolina, Coches)
-    "Turismo/Ocio": 0.15,   # 15% (Hoteles, Restaurantes)
-    "Core/Resto": 0.40      # 40% (Ropa, Muebles, Servicios, etc.)
+    "Alimentos": 0.20,
+    "Energía/Vivienda": 0.13,
+    "Transporte": 0.12,
+    "Turismo/Ocio": 0.15,
+    "Core (Ropa/Servicios)": 0.40
 }
 
-# --- 2. DICCIONARIO SEMÁNTICO SECTORIAL (El "Cerebro") ---
-# La IA busca estos conceptos específicos para saber QUÉ parte de la economía se mueve.
-SECTOR_KEYWORDS = {
-    "Alimentos": {
-        "subida": ["sequía", "aceite", "fruta", "carne", "cesta", "subida alimentos", "inflación alimentos"],
-        "bajada": ["bajada iva", "supermercado baja", "oferta alimentos", "cosecha récord"],
-        "impacto": 0.08 # Sensibilidad alta (Alimentos son volátiles)
-    },
-    "Energía/Vivienda": {
-        "subida": ["luz sube", "gas dispara", "factura", "tope gas", "invierno", "calefacción"],
-        "bajada": ["luz baja", "excepción ibérica", "bajada impuestos luz", "gas natural baja"],
-        "impacto": 0.15 # Sensibilidad muy alta
-    },
-    "Transporte": {
-        "subida": ["gasolina", "diesel", "surtidor", "petróleo", "barril", "transporte"],
-        "bajada": ["subsidio", "ayuda combustible", "bajada gasolina"],
-        "impacto": 0.10
-    },
-    "Turismo/Ocio": {
-        "subida": ["hotel", "vuelos", "vacaciones", "restaurantes", "semana santa", "verano"],
-        "bajada": ["fin temporada", "hoteles baratos", "baja ocupación"],
-        "impacto": 0.12
-    },
-    "Core/Resto": {
-        "subida": ["nueva colección", "inflación subyacente", "servicios"],
-        "bajada": ["rebajas", "descuentos", "black friday", "promociones"],
-        "impacto": 0.05
-    }
+# --- 2. CONFIGURACIÓN DE LOS "SABUESOS" (BUSCADORES ESPECÍFICOS) ---
+# Cada sector tiene su propia "Query" de búsqueda para obligar a Google a darnos datos.
+SECTOR_QUERIES = {
+    "Alimentos": "precio alimentos cesta compra aceite fruta supermercado España",
+    "Energía/Vivienda": "precio luz gas electricidad tarifa regulada tope gas España",
+    "Transporte": "precio gasolina diesel carburantes surtidor transporte España",
+    "Turismo/Ocio": "precio hoteles vacaciones vuelos restaurantes semana santa España",
+    "Core (Ropa/Servicios)": "rebajas ropa inflación servicios ipc subyacente España"
 }
 
-# --- 3. ESTACIONALIDAD SECTORIAL (El "Reloj" del País) ---
-# Cada sector tiene su propio ritmo biológico durante el año.
-def get_sectorial_seasonality(month, year):
-    # Detección Pascua
+# Palabras clave de sentimiento
+SENTIMENT_MAP = {
+    "subida": 1, "alza": 1, "dispara": 1.5, "caro": 1, "récord": 1.5,
+    "bajada": -1, "descenso": -1, "desploma": -1.5, "barato": -1, "oferta": -0.5,
+    "frena": -0.5, "modera": -0.5 # Inversión de tendencia
+}
+
+# --- 3. ESTACIONALIDAD BASE (Reloj Biológico del IPC) ---
+def get_seasonality(month, year):
+    # Cálculo Pascua
     a = year % 19; b = year // 100; c = year % 100; d = b // 4; e = b % 4
     f = (b + 8) // 25; g = (b - f + 1) // 3; h = (19 * a + b - d - g + 15) % 30
     i = c // 4; k = c % 4; l = (32 + 2 * e + 2 * i - h - k) % 7
     m = (a + 11 * h + 22 * l) // 451
-    easter_month = (h + l - 7 * m + 114) // 31
+    easter_m = (h + l - 7 * m + 114) // 31
     
-    # Matriz Base (Mes: {Sector: Valor})
-    seasonality = {
-        # ENERO: Rebajas fuertes en Core (Ropa), subida en Energía (frío)
-        1: {"Alimentos": 0.3, "Energía/Vivienda": 0.5, "Transporte": 0.0, "Turismo/Ocio": -0.4, "Core/Resto": -1.8}, 
-        # FEBRERO: Rebote técnico
-        2: {"Alimentos": 0.2, "Energía/Vivienda": 0.0, "Transporte": 0.2, "Turismo/Ocio": 0.1, "Core/Resto": 0.2},
-        # MARZO: Transición
-        3: {"Alimentos": 0.1, "Energía/Vivienda": -0.2, "Transporte": 0.3, "Turismo/Ocio": 0.3, "Core/Resto": 0.8},
-        # MAYO: Valle Alimentos
-        5: {"Alimentos": -0.4, "Energía/Vivienda": -0.1, "Transporte": 0.1, "Turismo/Ocio": 0.2, "Core/Resto": 0.1},
-        # JULIO: Rebajas verano
-        7: {"Alimentos": 0.0, "Energía/Vivienda": 0.4, "Transporte": 0.3, "Turismo/Ocio": 0.8, "Core/Resto": -1.8},
-        # OCTUBRE: Ropa invierno
-        10:{"Alimentos": 0.1, "Energía/Vivienda": 0.3, "Transporte": -0.1, "Turismo/Ocio": -0.5, "Core/Resto": 1.5},
-        # DEFAULT
-        "default": {"Alimentos": 0.1, "Energía/Vivienda": 0.1, "Transporte": 0.1, "Turismo/Ocio": 0.1, "Core/Resto": 0.1}
+    # Matriz Base (Ajustada para clavar Enero)
+    base = {
+        1: {"Alimentos": 0.2, "Energía/Vivienda": 0.6, "Transporte": 0.1, "Turismo/Ocio": -0.5, "Core (Ropa/Servicios)": -1.9},
+        2: {"Alimentos": 0.2, "Energía/Vivienda": 0.0, "Transporte": 0.2, "Turismo/Ocio": 0.2, "Core (Ropa/Servicios)": 0.2},
+        3: {"Alimentos": 0.1, "Energía/Vivienda": -0.2, "Transporte": 0.3, "Turismo/Ocio": 0.3, "Core (Ropa/Servicios)": 0.9},
+        4: {"Alimentos": 0.1, "Energía/Vivienda": 0.0, "Transporte": 0.2, "Turismo/Ocio": 0.1, "Core (Ropa/Servicios)": 0.5},
+        5: {"Alimentos": -0.4, "Energía/Vivienda": -0.1, "Transporte": 0.1, "Turismo/Ocio": 0.2, "Core (Ropa/Servicios)": 0.1},
+        6: {"Alimentos": 0.1, "Energía/Vivienda": 0.4, "Transporte": 0.2, "Turismo/Ocio": 0.6, "Core (Ropa/Servicios)": 0.1},
+        7: {"Alimentos": 0.0, "Energía/Vivienda": 0.5, "Transporte": 0.3, "Turismo/Ocio": 0.9, "Core (Ropa/Servicios)": -1.8},
+        8: {"Alimentos": 0.1, "Energía/Vivienda": 0.1, "Transporte": 0.1, "Turismo/Ocio": 0.2, "Core (Ropa/Servicios)": 0.1},
+        9: {"Alimentos": -0.1, "Energía/Vivienda": 0.0, "Transporte": -0.2, "Turismo/Ocio": -1.5, "Core (Ropa/Servicios)": 1.2},
+        10:{"Alimentos": 0.2, "Energía/Vivienda": 0.4, "Transporte": -0.1, "Turismo/Ocio": -0.5, "Core (Ropa/Servicios)": 1.8},
+        11:{"Alimentos": 0.1, "Energía/Vivienda": 0.2, "Transporte": 0.0, "Turismo/Ocio": -0.2, "Core (Ropa/Servicios)": 0.1},
+        12:{"Alimentos": 0.5, "Energía/Vivienda": 0.3, "Transporte": 0.1, "Turismo/Ocio": 0.5, "Core (Ropa/Servicios)": 0.2}
     }
     
-    current = seasonality.get(month, seasonality["default"]).copy()
+    current = base.get(month, base[1]).copy()
     
-    # Ajuste Dinámico de Pascua
-    if month == easter_month:
-        current["Turismo/Ocio"] += 1.5 # Boost fuerte
-    elif month == easter_month - 1:
-        current["Turismo/Ocio"] += 0.5 # Pre-boost
+    # Ajuste Pascua
+    if month == easter_m: current["Turismo/Ocio"] += 1.2
+    elif month == easter_m - 1: current["Turismo/Ocio"] += 0.4
         
     return current
 
-# --- 4. MOTOR NLP SECTORIAL (Deep Learning Simulado) ---
-def analyze_news_by_sector(year, month):
-    try:
-        # Búsqueda amplia para captar todo el ruido económico
-        gnews = GNews(language='es', country='ES', period='15d', max_results=30)
-        news = gnews.get_news("economía precios España")
-        
-        sector_scores = {k: 0.0 for k in SECTOR_WEIGHTS.keys()}
-        evidence = {k: [] for k in SECTOR_WEIGHTS.keys()}
-        
-        for art in news:
-            text = art['title'].lower()
-            
-            # Clasificación por Sector
-            for sector, rules in SECTOR_KEYWORDS.items():
-                impact_val = 0.0
-                
-                # Check Subidas
-                for kw in rules["subida"]:
-                    if kw in text:
-                        # Modificadores de intensidad
-                        multiplier = 1.0
-                        if "dispara" in text or "fuerte" in text: multiplier = 1.5
-                        if "leve" in text or "frena" in text: multiplier = 0.2
-                        
-                        impact_val = rules["impacto"] * multiplier
-                        evidence[sector].append(f"🔴 {art['title']}")
-                        break
-                
-                # Check Bajadas
-                if impact_val == 0:
-                    for kw in rules["bajada"]:
-                        if kw in text:
-                            impact_val = -rules["impacto"]
-                            evidence[sector].append(f"🟢 {art['title']}")
-                            break
-                
-                sector_scores[sector] += impact_val
-        
-        # Normalización (Topes lógicos por sector)
-        for s in sector_scores:
-            sector_scores[s] = max(min(sector_scores[s], 1.5), -1.5)
-            
-        return sector_scores, evidence
-    except:
-        return {k: 0.0 for k in SECTOR_WEIGHTS.keys()}, {}
-
-# --- 5. MOTOR DE MERCADO (Hard Data) ---
-def get_market_inputs(year, month):
-    # Esto afecta principalmente a Energía y Transporte
-    tickers = {"BRENT": "CL=F", "GAS": "NG=F"}
+# --- 4. MOTOR DE CAZA ACTIVA (ACTIVE HUNTING) ---
+def hunt_news_per_sector(year, month):
+    impacts = {}
+    evidence = {}
     
-    # Fechas
+    # Determinamos fechas
+    dt_target = datetime.datetime(year, month, 1)
+    is_future = dt_target > datetime.datetime.now()
+    
+    if is_future:
+        # Si es futuro, buscamos noticias RECIENTES (últimos 10 días) para ver tendencia actual
+        period = '10d'
+        start_d = None; end_d = None
+    else:
+        last = calendar.monthrange(year, month)[1]
+        start_d = (year, month, 1)
+        end_d = (year, month, last)
+        period = None
+
+    # Inicializamos barra de progreso visual en el frontend
+    status_msg = st.status("🐕 Soltando a los sabuesos de noticias...", expanded=True)
+    
+    for sector, query in SECTOR_QUERIES.items():
+        status_msg.write(f"🔍 Buscando datos para: **{sector}**...")
+        
+        try:
+            gnews = GNews(language='es', country='ES', period=period, start_date=start_d, end_date=end_d, max_results=15)
+            # Añadimos el año a la query para contexto si es pasado
+            full_query = f"{query} {year}" if not is_future else query
+            
+            news = gnews.get_news(full_query)
+            
+            score = 0.0
+            found_headlines = []
+            
+            for art in news:
+                t = art['title'].lower()
+                val = 0
+                for w, v in SENTIMENT_MAP.items():
+                    if w in t:
+                        val += v
+                
+                # IVA es especial
+                if "iva" in t and "baja" in t: val -= 2.0
+                if "iva" in t and "sube" in t: val += 2.0
+                
+                if val != 0:
+                    score += val
+                    if len(found_headlines) < 2: found_headlines.append(f"{art['title']}")
+            
+            # Normalización del sector (Sensibilidad)
+            # Alimentos y Energía son muy sensibles, Turismo menos por noticias
+            sensitivity = 0.03 if sector == "Core (Ropa/Servicios)" else 0.05
+            
+            # Calculamos promedio del sentimiento
+            if len(news) > 0:
+                avg_score = score / max(len(news), 1)
+                final_sector_impact = avg_score * sensitivity
+            else:
+                final_sector_impact = 0.0
+                found_headlines = ["(Sin datos específicos, usando inercia)"]
+            
+            impacts[sector] = final_sector_impact
+            evidence[sector] = found_headlines
+            
+            time.sleep(0.2) # Pequeña pausa para no saturar Google
+            
+        except Exception as e:
+            impacts[sector] = 0.0
+            evidence[sector] = [f"Error de conexión: {str(e)}"]
+            
+    status_msg.update(label="✅ Caza de noticias completada", state="complete", expanded=False)
+    return impacts, evidence
+
+# --- 5. MOTOR MERCADO (HARD DATA) ---
+def get_market_data(year, month):
     dt_target = datetime.datetime(year, month, 1)
     if dt_target > datetime.datetime.now():
         end = datetime.datetime.now()
@@ -157,116 +169,125 @@ def get_market_inputs(year, month):
         last = calendar.monthrange(year, month)[1]
         start = dt_target; end = datetime.datetime(year, month, last)
         
-    adjustments = {"Energía/Vivienda": 0.0, "Transporte": 0.0}
-    logs = []
+    adjustments = {k: 0.0 for k in SECTOR_WEIGHTS.keys()}
+    
+    tickers = {"BRENT": ("CL=F", "Transporte"), "GAS": ("NG=F", "Energía/Vivienda")}
     
     try:
-        for name, sym in tickers.items():
+        for name, (sym, sector) in tickers.items():
             df = yf.download(sym, start=start, end=end, progress=False, auto_adjust=True)
             if not df.empty:
-                op = df.iloc[0]['Open']; cl = df.iloc[-1]['Close']
+                op = float(df.iloc[0]['Open']); cl = float(df.iloc[-1]['Close'])
                 change = ((cl - op) / op) * 100
                 
-                # Transmisión a IPC (Solo si es significativo >3%)
-                if abs(change) > 3.0:
-                    impact = change * 0.02 # Coeficiente de pase
-                    if name == "BRENT": adjustments["Transporte"] += impact
-                    if name == "GAS": adjustments["Energía/Vivienda"] += impact
-                    logs.append(f"{name}: {change:+.1f}% -> Impacto {impact:+.2f}%")
+                # Filtro de Ruido (>4%)
+                if abs(change) > 4.0:
+                    impact = change * 0.015 # Transmisión
+                    adjustments[sector] += impact
     except: pass
     
-    return adjustments, logs
+    return adjustments
 
 # --- FRONTEND ---
 with st.sidebar:
-    st.title("ORACLE V38")
-    st.caption("Deep Sectorial Learning")
+    st.title("ORACLE V39")
+    st.caption("Active Sectorial Hunting")
     
-    t_year = st.number_input("Año", 2024, 2030, 2026)
-    t_month = st.selectbox("Mes", range(1, 13))
+    col_y, col_m = st.columns(2)
+    t_year = col_y.number_input("Año", 2024, 2030, 2026)
+    t_month = col_m.selectbox("Mes", range(1, 13))
     
     st.divider()
     base_annual = st.number_input("IPC Anual Previo", value=2.90)
-    old_monthly = st.number_input("IPC Saliente (Año Pasado)", value=-0.20)
+    old_monthly = st.number_input("IPC Saliente (-1 año)", value=-0.20)
     
-    if st.button("ALIMENTAR MODELO"):
-        st.session_state.run = True
+    if st.button("INICIAR RASTREO"):
+        st.session_state.hunting = True
 
-if 'run' in st.session_state:
-    # 1. CARGA DE BASE ESTACIONAL
-    seasonality = get_sectorial_seasonality(t_month, t_year)
+if 'hunting' in st.session_state:
+    st.title(f"Informe de Inteligencia: {calendar.month_name[t_month]} {t_year}")
     
-    # 2. ANÁLISIS NOTICIAS (SOFT DATA)
-    news_impacts, news_evidence = analyze_news_by_sector(t_year, t_month)
+    # 1. ESTACIONALIDAD
+    seasonal_data = get_seasonality(t_month, t_year)
     
-    # 3. ANÁLISIS MERCADO (HARD DATA)
-    mkt_impacts, mkt_logs = get_market_inputs(t_year, t_month)
+    # 2. CAZA DE NOTICIAS (ACTIVE HUNTING)
+    news_impacts, news_evidence = hunt_news_per_sector(t_year, t_month)
     
-    # 4. FUSIÓN Y PONDERACIÓN
-    final_monthly_cpi = 0.0
-    sector_breakdown = {}
+    # 3. DATOS MERCADO
+    mkt_impacts = get_market_data(t_year, t_month)
     
-    st.title(f"Análisis Forense: {calendar.month_name[t_month]} {t_year}")
+    # 4. FUSIÓN
+    total_monthly = 0.0
+    sector_results = {}
     
-    col_main, col_detail = st.columns([1, 1])
+    col_left, col_right = st.columns([3, 2])
     
-    with col_main:
-        st.subheader("🏗️ Construcción del Dato")
+    with col_left:
+        st.subheader("🧩 Desglose por Sector")
         
         for sector, weight in SECTOR_WEIGHTS.items():
-            # Suma de factores por sector
-            s_base = seasonality.get(sector, 0.1)
+            # Suma de factores
+            s_base = seasonal_data.get(sector, 0.0)
             s_news = news_impacts.get(sector, 0.0)
             s_mkt = mkt_impacts.get(sector, 0.0)
             
-            total_sector_var = s_base + s_news + s_mkt
-            weighted_contribution = total_sector_var * weight
+            # Valor final del sector
+            sector_val = s_base + s_news + s_mkt
             
-            final_monthly_cpi += weighted_contribution
-            sector_breakdown[sector] = weighted_contribution
+            # Contribución al IPC General (Valor * Peso)
+            contribution = sector_val * weight
+            total_monthly += contribution
             
-            # Visualización Tarjeta Sector
-            with st.container():
-                st.markdown(f"""
-                <div class="sector-card">
-                    <b>{sector}</b> (Peso: {int(weight*100)}%)<br>
-                    Variación: <span style="color:{'#00ff99' if total_sector_var>0 else '#ff4444'}">{total_sector_var:+.2f}%</span> 
-                    (Aporta al IPC: {weighted_contribution:+.3f}%)
+            sector_results[sector] = contribution
+            
+            # Visualización
+            headlines_html = "".join([f"<li>{h}</li>" for h in news_evidence[sector][:2]])
+            
+            # Color según si sube o baja
+            color_border = "#58a6ff" if contribution > 0 else "#3fb950" 
+            
+            st.markdown(f"""
+            <div class="sector-box" style="border-left: 4px solid {color_border}">
+                <div style="display:flex; justify-content:space-between;">
+                    <span style="font-weight:bold; font-size:1.1em;">{sector}</span>
+                    <span style="color:{color_border}; font-weight:bold;">{sector_val:+.2f}% (Aporta {contribution:+.3f})</span>
                 </div>
-                """, unsafe_allow_html=True)
+                <div style="font-size:0.8em; color:#8b949e; margin-top:5px;">
+                    <i>Inercia: {s_base}% | Noticias: {s_news:.3f}% | Mercado: {s_mkt:.3f}%</i>
+                </div>
+                <ul style="font-size:0.8em; margin-top:5px; padding-left:20px; color:#c9d1d9;">
+                    {headlines_html}
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
 
-    # 5. RESULTADOS FINALES
+    # 5. CÁLCULO ANUAL
     f_base = 1 + base_annual/100
     f_out = 1 + old_monthly/100
-    f_in = 1 + final_monthly_cpi/100
+    f_in = 1 + total_monthly/100
     final_annual = ((f_base / f_out) * f_in - 1) * 100
     
-    with col_detail:
-        st.subheader("🎯 Predicción Final")
+    with col_right:
+        st.subheader("📈 Resultado Consolidado")
+        
         c1, c2 = st.columns(2)
-        c1.metric("IPC MENSUAL", f"{final_monthly_cpi:+.2f}%")
-        c2.metric("IPC ANUAL", f"{final_annual:.2f}%", f"{final_annual-base_annual:+.2f}%")
+        c1.metric("IPC MENSUAL", f"{total_monthly:+.2f}%", "Suma Ponderada")
+        c2.metric("IPC ANUAL", f"{final_annual:.2f}%", f"{final_annual-base_annual:+.2f}% vs Previo")
         
-        st.markdown("---")
-        st.subheader("📰 Evidencia Encontrada")
+        # Gráfico Donut
+        labels = list(sector_results.keys())
+        values = [abs(v) for v in sector_results.values()]
         
-        tabs = st.tabs(list(SECTOR_WEIGHTS.keys()))
-        for i, sector in enumerate(SECTOR_WEIGHTS.keys()):
-            with tabs[i]:
-                if sector in mkt_impacts and mkt_impacts[sector] != 0:
-                    st.caption("FUTUROS:")
-                    st.write(f"Impacto Mercado: {mkt_impacts[sector]:+.2f}%")
-                    
-                ev = news_evidence.get(sector, [])
-                if ev:
-                    for e in ev: st.caption(e)
-                else:
-                    st.caption("Sin noticias específicas detectadas.")
-                    
-    # GRÁFICO FINAL (DONUT DE APORTACIÓN)
-    labels = list(sector_breakdown.keys())
-    values = [abs(v) for v in sector_breakdown.values()] # Solo magnitud visual
-    
-    fig = go.Figure(data=[go.Pie(labels=labels, values=values, hole=.5)])
-    fig.update_layout(title="Peso de cada Sector en el Dato Final", height=300, template="plotly_dark")
-    st.plotly_chart(fig, use_container_width=True)
+        fig = go.Figure(data=[go.Pie(labels=labels, values=values, hole=.6)])
+        fig.update_layout(title="Peso en la Variación", template="plotly_dark", height=300, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.info(f"""
+        **Análisis de Impacto:**
+        La inflación anual se sitúa en **{final_annual:.2f}%**.
+        Esto se debe principalmente al comportamiento del sector **{max(sector_results, key=sector_results.get)}**, 
+        que ha aportado **{max(sector_results.values()):+.3f}%** al índice general.
+        """)
+
+else:
+    st.info("Configura el año y mes a la izquierda para liberar a los sabuesos.")
